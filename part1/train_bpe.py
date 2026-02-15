@@ -194,5 +194,60 @@ def train_bpe(
             forbidden_substrings.add(special_bytes[:i])
     
     # TODO: Implement BPE training
-    
-    raise NotImplementedError("Implement train_bpe")
+    # 1. Initialize vocabulary
+    vocab = {}
+    token_id = 0
+    for token in special_tokens:
+        vocab[token_id] = token.encode("utf-8")
+        token_id += 1
+    for i in range(256):
+        vocab[token_id] = bytes([i])
+        token_id += 1
+
+    # 2. Word frequency counting
+    word_freqs = Counter()
+    for line in text.splitlines():
+        for pre_token in pre_tokenize(line, special_tokens):
+            byte_seq = pre_token.encode("utf-8")
+
+            if any(fs in byte_seq for fs in forbidden_substrings):
+                continue
+
+            word = tuple(bytes([b]) for b in byte_seq)
+            word_freqs[word] += 1
+
+    # 3. Pair frequency counting
+    pair_counts = Counter()
+    for word, freq in word_freqs.items():
+        for pair in get_pairs(word):
+            pair_counts[pair] += freq
+
+    # 4. Merge loop (repeated until vocab_size is reached)
+    merges = []
+    while len(vocab) < vocab_size:
+        # select best pair
+        best_pair = min(pair_counts, key=lambda p: (-pair_counts[p], p))
+        if pair_counts[best_pair] == 0:
+            break
+
+        # create merged token
+        new_token = best_pair[0] + best_pair[1]
+        vocab[token_id] = new_token
+        token_id += 1
+        merges.append(best_pair)
+
+        # update word representations
+        new_word_freqs = Counter()
+        for word, freq in word_freqs.items():
+            if best_pair in get_pairs(word):
+                word = merge_word(word, best_pair)
+            new_word_freqs[word] += freq
+        word_freqs = new_word_freqs
+
+        # update pair counts
+        pair_counts = Counter()
+        for word, freq in word_freqs.items():
+            for pair in get_pairs(word):
+                pair_counts[pair] += freq
+
+    return vocab, merges

@@ -30,6 +30,7 @@ class Tokenizer:
         self.vocab = vocab  # id -> bytes
         self.inverse_vocab = {v: k for k, v in vocab.items()}  # bytes -> id (also used as rank)
         self.merges = merges
+        self.bpe_ranks = {pair: i for i, pair in enumerate(self.merges)}
         # Note: We use inverse_vocab for BPE ranking, not the merges list.
         # In GPT-2/tiktoken, the token ID serves as the rank - lower ID = higher priority.
         # This is different from naive BPE which uses merge order.
@@ -83,8 +84,41 @@ class Tokenizer:
         
         # TODO: Implement BPE algorithm
         # Return tokens
-        
-        raise NotImplementedError("Implement _bpe")
+        while True:
+            pairs = self._get_pairs(tokens)
+            if not pairs:
+                break
+
+            # Find the best pair to merge based on vocab rank
+            best_pair = None
+            best_rank = float("inf")
+
+            for pair in pairs:
+                rank = self.bpe_ranks.get(pair, float("inf"))
+                if rank < best_rank:
+                    best_rank = rank
+                    best_pair = pair
+
+            if best_pair is None or best_rank == float("inf"):
+                break
+
+
+            # Merge all occurrences of best_pair
+            new_tokens = []
+            i = 0
+            while i < len(tokens):
+                if i < len(tokens) - 1 and tokens[i] == best_pair[0] and tokens[i + 1] == best_pair[1]:
+                    new_tokens.append(best_pair[0] + best_pair[1])
+                    # skip the next token since it is merged
+                    i += 2
+                else:
+                    new_tokens.append(tokens[i])
+                    i += 1
+            tokens = new_tokens
+
+
+        return tokens
+
 
     def _split_with_special_tokens(self, text: str) -> list[tuple[str, bool]]:
         """
@@ -140,8 +174,17 @@ class Tokenizer:
         
         ids = []
         # TODO: Implement encoding
-        
-        raise NotImplementedError("Implement _encode_chunk")
+        # convert text to applicable pre-tokens for BPE
+        pre_tokens = self.pat.findall(text)
+        for pre_token in pre_tokens:
+            byte_seq = pre_token.encode("utf-8")
+            bpe_tokens = self._bpe(byte_seq)
+            if all(t in self.inverse_vocab for t in bpe_tokens):
+                ids.extend(self.inverse_vocab[t] for t in bpe_tokens)
+            else:
+                # fallback to individual bytes if any BPE token is unknown
+                ids.extend(self.inverse_vocab[bytes([b])] for b in byte_seq)
+        return ids
 
     def encode(self, text: str) -> list[int]:
         """
@@ -190,8 +233,13 @@ class Tokenizer:
             return ""
         
         # TODO: Implement decoding
+        byte_chunks = []
+        for token_id in ids:
+            token_bytes = self.vocab.get(token_id, b"")
+            byte_chunks.append(token_bytes)
+        all_bytes = b"".join(byte_chunks)
+        return all_bytes.decode("utf-8", errors="replace")
         
-        raise NotImplementedError("Implement decode")
 
     def encode_iterable(self, iterable: Iterator[str]) -> Iterator[int]:
         """
