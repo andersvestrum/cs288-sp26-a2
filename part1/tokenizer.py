@@ -94,7 +94,8 @@ class Tokenizer:
             best_rank = float("inf")
 
             for pair in pairs:
-                rank = self.bpe_ranks.get(pair, float("inf"))
+                merged = pair[0] + pair[1]
+                rank = self.inverse_vocab.get(merged, float("inf"))
                 if rank < best_rank:
                     best_rank = rank
                     best_pair = pair

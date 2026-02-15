@@ -206,48 +206,72 @@ def train_bpe(
 
     # 2. Word frequency counting
     word_freqs = Counter()
-    for line in text.splitlines():
-        for pre_token in pre_tokenize(line, special_tokens):
-            byte_seq = pre_token.encode("utf-8")
+    for pre_token in pre_tokenize(text, special_tokens):
+        byte_seq = pre_token.encode("utf-8")
 
-            if any(fs in byte_seq for fs in forbidden_substrings):
-                continue
+        if any(fs in byte_seq for fs in forbidden_substrings):
+            continue
 
-            word = tuple(bytes([b]) for b in byte_seq)
-            word_freqs[word] += 1
+        word = tuple(bytes([b]) for b in byte_seq)
+        word_freqs[word] += 1
 
-    # 3. Pair frequency counting
+    # 3. Initial pair frequency counting
     pair_counts = Counter()
+    pair_to_words = {}
     for word, freq in word_freqs.items():
         for pair in get_pairs(word):
             pair_counts[pair] += freq
+            if pair not in pair_to_words:
+                pair_to_words[pair] = set()
+            pair_to_words[pair].add(word)
+
 
     # 4. Merge loop (repeated until vocab_size is reached)
     merges = []
     while len(vocab) < vocab_size:
-        # select best pair
-        best_pair = min(pair_counts, key=lambda p: (-pair_counts[p], p))
-        if pair_counts[best_pair] == 0:
+        if not pair_counts:
             break
 
-        # create merged token
+        # Select best pair (highest freq, then lexicographically smallest for ties)
+        best_pair = max(pair_counts, key=lambda p: (pair_counts[p], p))
+        if pair_counts[best_pair] <= 0:
+            break
+
+        # Create merged token
         new_token = best_pair[0] + best_pair[1]
         vocab[token_id] = new_token
         token_id += 1
         merges.append(best_pair)
 
-        # update word representations
-        new_word_freqs = Counter()
-        for word, freq in word_freqs.items():
-            if best_pair in get_pairs(word):
-                word = merge_word(word, best_pair)
-            new_word_freqs[word] += freq
-        word_freqs = new_word_freqs
+        # Incrementally update: only process words that contain the merged pair
+        affected_words = pair_to_words.get(best_pair, set()).copy()
 
-        # update pair counts
-        pair_counts = Counter()
-        for word, freq in word_freqs.items():
-            for pair in get_pairs(word):
+        for old_word in affected_words:
+            if old_word not in word_freqs:
+                continue
+            freq = word_freqs[old_word]
+
+            new_word = merge_word(old_word, best_pair)
+            if new_word == old_word:
+                continue
+
+            # Remove old word's pair contributions
+            for pair in get_pairs(old_word):
+                pair_counts[pair] -= freq
+                if pair_counts[pair] <= 0:
+                    del pair_counts[pair]
+                if pair in pair_to_words:
+                    pair_to_words[pair].discard(old_word)
+
+            # Replace old word with new word in word_freqs
+            del word_freqs[old_word]
+            word_freqs[new_word] += freq
+
+            # Add new word's pair contributions
+            for pair in get_pairs(new_word):
                 pair_counts[pair] += freq
+                if pair not in pair_to_words:
+                    pair_to_words[pair] = set()
+                pair_to_words[pair].add(new_word)
 
     return vocab, merges
