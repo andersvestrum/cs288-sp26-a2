@@ -123,6 +123,62 @@ class PromptingPipeline:
         return [self.predict_single(ex["context"], ex["question"], ex["choices"]) for ex in examples]
 
 
+class LikelihoodPipeline:
+    """Score each answer choice by how likely the model thinks it is as a continuation."""
+    
+    def __init__(self, model, tokenizer, device: str = "cuda", max_length: int = 512):
+        self.model = model.to(device) if hasattr(model, 'to') else model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.max_length = max_length
+    
+    @torch.no_grad()
+    def _score_completion(self, prefix_ids: List[int], completion_ids: List[int]) -> float:
+        """Compute average log-prob of completion_ids given prefix_ids."""
+        if not completion_ids:
+            return float("-inf")
+        all_ids = prefix_ids + completion_ids
+        if len(all_ids) > self.max_length:
+            trim = len(all_ids) - self.max_length
+            all_ids = all_ids[trim:]
+            start = max(0, len(prefix_ids) - trim)
+        else:
+            start = len(prefix_ids)
+        if start >= len(all_ids):
+            return float("-inf")
+        input_ids = torch.tensor([all_ids], device=self.device)
+        logits = self.model(input_ids)
+        log_probs = torch.log_softmax(logits[0], dim=-1)
+        total = 0.0
+        count = 0
+        for i in range(start, len(all_ids)):
+            token_id = all_ids[i]
+            total += log_probs[i - 1, token_id].item()
+            count += 1
+        return total / count if count > 0 else float("-inf")
+    
+    @torch.no_grad()
+    def predict_single(self, context: str, question: str, choices: List[str], return_probs: bool = False):
+        self.model.eval()
+        prefix = f"{context} {question} "
+        prefix_ids = self.tokenizer.encode(prefix)
+        scores = []
+        for choice_text in choices:
+            completion_ids = self.tokenizer.encode(choice_text)
+            score = self._score_completion(prefix_ids, completion_ids)
+            scores.append(score)
+        scores_t = torch.tensor(scores)
+        probs = softmax(scores_t, dim=-1)
+        prediction = probs.argmax().item()
+        if return_probs:
+            return prediction, probs.tolist()
+        return prediction
+    
+    @torch.no_grad()
+    def predict_batch(self, examples: List[Dict[str, Any]], batch_size: int = 8) -> List[int]:
+        return [self.predict_single(ex["context"], ex["question"], ex["choices"]) for ex in examples]
+
+
 def evaluate_prompting(pipeline, examples: List[Dict[str, Any]], batch_size: int = 8) -> Dict[str, Any]:
     predictions = pipeline.predict_batch(examples, batch_size)
     correct = sum(1 for p, ex in zip(predictions, examples) if ex.get("answer", -1) >= 0 and p == ex["answer"])
