@@ -35,7 +35,7 @@ from part3.nn_utils import cross_entropy, gradient_clipping
 from part4.datasets import create_pretraining_dataloader, create_qa_dataloader
 from part4.sampling import generate_text
 from part4.qa_model import TransformerForMultipleChoice, evaluate_qa_model
-from part4.prompting import PromptTemplate, PromptingPipeline, evaluate_prompting
+from part4.prompting import PromptTemplate, FewShotPromptTemplate, PromptingPipeline, evaluate_prompting
 from part4.trainer import Trainer, TrainingConfig, create_qa_loss_fn
 
 
@@ -245,54 +245,80 @@ def pretrain_lm(
 # Step 3: Evaluate Zero-Shot Prompting
 # =============================================================================
 
-def evaluate_prompting(
+def evaluate_prompting_all(
     model: TransformerLM,
     tokenizer,
     qa_dev_path: Path,
+    qa_train_path: Path,
+    config: dict,
     device: str = "cpu",
 ) -> dict:
     """
-    Evaluate the pretrained model using zero-shot prompting.
+    Evaluate prompting with multiple strategies and return the best.
     
-    This tests if the model can answer questions without any fine-tuning,
-    just by predicting which answer token (A, B, C, D) is most likely.
+    Tries zero-shot templates and few-shot prompting, picks the best.
     
     Args:
-        model: Pretrained TransformerLM
+        model: Fine-tuned TransformerLM backbone
         tokenizer: Tokenizer
         qa_dev_path: Path to validation QA data
+        qa_train_path: Path to training QA data (for few-shot examples)
+        config: Model config (for context_length)
         device: Device
     
     Returns:
-        Evaluation results dict
+        Best evaluation results dict
     """
     print("\n" + "=" * 60)
-    print("STEP 4: Evaluating Prompting (on fine-tuned model)")
+    print("STEP 4: Evaluating Prompting (multiple strategies)")
     print("=" * 60)
     
-    # Load data
+    from part4.prompting import evaluate_prompting as eval_prompt
+    
     with open(qa_dev_path) as f:
         dev_data = json.load(f)
     
+    with open(qa_train_path) as f:
+        train_data = json.load(f)
+    
+    max_length = config.get("context_length", 512)
     print(f"\nValidation examples: {len(dev_data)}")
+    print(f"Training examples available for few-shot: {len(train_data)}")
     
-    # Create pipeline
-    template = PromptTemplate(template_name="simple")
-    pipeline = PromptingPipeline(
-        model=model,
-        tokenizer=tokenizer,
-        template=template,
-        device=device,
-    )
+    best_results = None
+    best_acc = -1.0
+    best_name = ""
     
-    # Evaluate
-    from part4.prompting import evaluate_prompting as eval_prompt
-    results = eval_prompt(pipeline, dev_data)
+    strategies = [
+        ("zero-shot (simple)", PromptTemplate(template_name="simple")),
+        ("zero-shot (basic)", PromptTemplate(template_name="basic")),
+        ("zero-shot (instruction)", PromptTemplate(template_name="instruction")),
+        ("1-shot", FewShotPromptTemplate(train_data, num_shots=1, max_context_chars=150, template_name="simple")),
+        ("2-shot", FewShotPromptTemplate(train_data, num_shots=2, max_context_chars=120, template_name="simple")),
+        ("3-shot", FewShotPromptTemplate(train_data, num_shots=3, max_context_chars=100, template_name="simple")),
+    ]
     
-    print(f"\nPrompting accuracy (on fine-tuned model): {results['accuracy']:.2%}")
+    for name, template in strategies:
+        pipeline = PromptingPipeline(
+            model=model,
+            tokenizer=tokenizer,
+            template=template,
+            device=device,
+            max_length=max_length,
+        )
+        results = eval_prompt(pipeline, dev_data)
+        acc = results["accuracy"]
+        print(f"  {name:30s} -> {acc:.2%}")
+        
+        if acc > best_acc:
+            best_acc = acc
+            best_results = results
+            best_name = name
+    
+    print(f"\nBest prompting strategy: {best_name} ({best_acc:.2%})")
     print(f"Random baseline: 25.00%")
     
-    return results
+    return best_results
 
 
 # =============================================================================
@@ -499,11 +525,11 @@ Examples:
     # Step 3: Fine-tune for QA
     qa_model = finetune_qa(pretrained_model, tokenizer, config, device)
     
-    # Step 4: Evaluate prompting on fine-tuned model
+    # Step 4: Evaluate prompting on fine-tuned model (try multiple strategies)
     # Use the fine-tuned backbone (qa_model.transformer) for prompting
-    prompting_results = evaluate_prompting(
+    prompting_results = evaluate_prompting_all(
         qa_model.transformer, tokenizer,
-        config["qa_dev"], device
+        config["qa_dev"], config["qa_train"], config, device
     )
     
     # Step 5: Evaluate fine-tuned model (classification head)

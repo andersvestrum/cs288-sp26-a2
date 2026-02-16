@@ -39,12 +39,48 @@ class PromptTemplate:
         return f"{prompt} {label}"
 
 
+class FewShotPromptTemplate(PromptTemplate):
+    """Prompt template that includes few-shot examples before the test question."""
+    
+    def __init__(self, examples: List[Dict[str, Any]], num_shots: int = 2,
+                 max_context_chars: int = 150, template_name: str = "simple", **kwargs):
+        super().__init__(template_name=template_name, **kwargs)
+        self.shot_examples = []
+        for ex in examples:
+            if len(self.shot_examples) >= num_shots:
+                break
+            if ex.get("answer", -1) >= 0:
+                self.shot_examples.append(ex)
+        self.max_context_chars = max_context_chars
+    
+    def _truncate_context(self, text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars].rsplit(" ", 1)[0] + "..."
+    
+    def format(self, context: str, question: str, choices: List[str], **kwargs) -> str:
+        parts = []
+        for ex in self.shot_examples:
+            ctx = self._truncate_context(ex["context"], self.max_context_chars)
+            shot_prompt = super().format(ctx, ex["question"], ex["choices"])
+            answer_label = chr(ord('A') + ex["answer"])
+            parts.append(f"{shot_prompt} {answer_label}")
+        
+        test_ctx = self._truncate_context(context, self.max_context_chars * 2)
+        test_prompt = super().format(test_ctx, question, choices)
+        parts.append(test_prompt)
+        
+        return "\n\n".join(parts)
+
+
 class PromptingPipeline:
-    def __init__(self, model, tokenizer, template: Optional[PromptTemplate] = None, device: str = "cuda"):
+    def __init__(self, model, tokenizer, template: Optional[PromptTemplate] = None,
+                 device: str = "cuda", max_length: int = 512):
         self.model = model.to(device) if hasattr(model, 'to') else model
         self.tokenizer = tokenizer
         self.template = template or PromptTemplate("basic")
         self.device = device
+        self.max_length = max_length
         self._setup_choice_tokens()
     
     def _setup_choice_tokens(self):
@@ -60,7 +96,10 @@ class PromptingPipeline:
     def predict_single(self, context: str, question: str, choices: List[str], return_probs: bool = False):
         self.model.eval()
         prompt = self.template.format(context, question, choices)
-        input_ids = torch.tensor([self.tokenizer.encode(prompt)], device=self.device)
+        token_ids = self.tokenizer.encode(prompt)
+        if len(token_ids) > self.max_length:
+            token_ids = token_ids[:self.max_length]
+        input_ids = torch.tensor([token_ids], device=self.device)
         logits = self.model(input_ids)[:, -1, :]
         
         choice_labels = ["A", "B", "C", "D"][:len(choices)]
