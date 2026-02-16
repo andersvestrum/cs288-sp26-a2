@@ -214,7 +214,9 @@ def evaluate_prompting_approach(model, tokenizer, config: dict, device: str = "c
         tokenizer=tokenizer,
         template=template,
         device=device,
+        max_length=config["context_length"],
     )
+
     
     # Evaluate
     results = evaluate_prompting(pipeline, dev_data)
@@ -384,11 +386,11 @@ def main():
     # Step 2: Pretrain LM
     pretrained_model = pretrain_model(tokenizer, config, device)
     
-    # Step 3: Evaluate prompting (zero-shot)
-    prompting_results = evaluate_prompting_approach(pretrained_model, tokenizer, config, device)
-    
     # Step 4: Fine-tune for QA
     qa_model = finetune_qa_model(pretrained_model, tokenizer, config, device)
+
+    # Step 3: Evaluate prompting (zero-shot)
+    prompting_results = evaluate_prompting_approach(pretrained_model, tokenizer, config, device)
     
     # Step 5: Evaluate fine-tuned model
     finetuned_results = evaluate_finetuned_model(qa_model, tokenizer, config, device)

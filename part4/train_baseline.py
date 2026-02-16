@@ -36,7 +36,11 @@ from part3.nn_utils import cross_entropy, gradient_clipping
 from part4.datasets import create_pretraining_dataloader, create_qa_dataloader
 from part4.sampling import generate_text
 from part4.qa_model import TransformerForMultipleChoice, evaluate_qa_model
-from part4.prompting import PromptTemplate, FewShotPromptTemplate, PromptingPipeline, LikelihoodPipeline, FewShotLikelihoodPipeline, evaluate_prompting
+from part4.prompting import (PromptTemplate, FewShotPromptTemplate, PromptingPipeline,
+    LikelihoodPipeline, FewShotLikelihoodPipeline,
+    MatchedFormatLikelihoodPipeline, CalibratedLikelihoodPipeline,
+    FewShotMatchedLikelihoodPipeline, CalibratedFewShotMatchedPipeline,
+    evaluate_prompting)
 from part4.trainer import Trainer, TrainingConfig, create_qa_loss_fn
 
 
@@ -289,64 +293,51 @@ def evaluate_prompting_all(
     best_results = None
     best_acc = -1.0
     best_name = ""
-    
-    # Likelihood-based strategies (score each choice as a continuation)
-    print("\n  Likelihood-based strategies:")
-    likelihood_strategies = [
-        ("likelihood (0-shot)", LikelihoodPipeline(
-            model=model, tokenizer=tokenizer, device=device, max_length=max_length,
-        )),
-        ("likelihood (1-shot)", FewShotLikelihoodPipeline(
-            model=model, tokenizer=tokenizer, train_examples=train_data,
-            num_shots=1, max_context_chars=150, device=device, max_length=max_length,
-        )),
-        ("likelihood (2-shot)", FewShotLikelihoodPipeline(
-            model=model, tokenizer=tokenizer, train_examples=train_data,
-            num_shots=2, max_context_chars=120, device=device, max_length=max_length,
-        )),
-        ("likelihood (3-shot)", FewShotLikelihoodPipeline(
-            model=model, tokenizer=tokenizer, train_examples=train_data,
-            num_shots=3, max_context_chars=100, device=device, max_length=max_length,
-        )),
-    ]
-    
-    for name, pipeline in likelihood_strategies:
+
+    def _eval(name, pipeline):
+        nonlocal best_acc, best_results, best_name
         results = eval_prompt(pipeline, dev_data)
         acc = results["accuracy"]
-        print(f"  {name:30s} -> {acc:.2%}")
+        print(f"  {name:40s} -> {acc:.2%}")
         if acc > best_acc:
             best_acc = acc
             best_results = results
             best_name = name
-    
-    # Token-prediction strategies (predict A/B/C/D)
+
+    # --- Matched-format strategies (use exact fine-tuning format) ---
+    print("\n  Matched-format likelihood strategies:")
+    _eval("matched-format (0-shot)", MatchedFormatLikelihoodPipeline(
+        model=model, tokenizer=tokenizer, device=device, max_length=max_length))
+    _eval("calibrated (0-shot, N/A)", CalibratedLikelihoodPipeline(
+        model=model, tokenizer=tokenizer, device=device, max_length=max_length,
+        calibration_context="N/A"))
+    _eval("calibrated (0-shot, empty)", CalibratedLikelihoodPipeline(
+        model=model, tokenizer=tokenizer, device=device, max_length=max_length,
+        calibration_context=""))
+
+    # Few-shot with matched format (different shot counts)
+    print("\n  Matched-format few-shot strategies:")
+    for ns in [1, 2, 3]:
+        _eval(f"matched few-shot ({ns}-shot)", FewShotMatchedLikelihoodPipeline(
+            model=model, tokenizer=tokenizer, train_examples=train_data,
+            num_shots=ns, device=device, max_length=max_length, max_shot_tokens=80))
+    for ns in [1, 2, 3]:
+        _eval(f"calibrated few-shot ({ns}-shot)", CalibratedFewShotMatchedPipeline(
+            model=model, tokenizer=tokenizer, train_examples=train_data,
+            num_shots=ns, device=device, max_length=max_length, max_shot_tokens=80))
+
+    # --- Original strategies for comparison ---
+    print("\n  Original likelihood strategies:")
+    _eval("orig likelihood (0-shot)", LikelihoodPipeline(
+        model=model, tokenizer=tokenizer, device=device, max_length=max_length))
+
     print("\n  Token-prediction strategies:")
-    strategies = [
-        ("zero-shot (simple)", PromptTemplate(template_name="simple")),
-        ("zero-shot (basic)", PromptTemplate(template_name="basic")),
-        ("zero-shot (instruction)", PromptTemplate(template_name="instruction")),
-        ("1-shot", FewShotPromptTemplate(train_data, num_shots=1, max_context_chars=150, template_name="simple")),
-        ("2-shot", FewShotPromptTemplate(train_data, num_shots=2, max_context_chars=120, template_name="simple")),
-        ("3-shot", FewShotPromptTemplate(train_data, num_shots=3, max_context_chars=100, template_name="simple")),
-    ]
-    
-    for name, template in strategies:
-        pipeline = PromptingPipeline(
-            model=model,
-            tokenizer=tokenizer,
-            template=template,
-            device=device,
-            max_length=max_length,
-        )
-        results = eval_prompt(pipeline, dev_data)
-        acc = results["accuracy"]
-        print(f"  {name:30s} -> {acc:.2%}")
-        
-        if acc > best_acc:
-            best_acc = acc
-            best_results = results
-            best_name = name
-    
+    for tname in ["simple", "basic", "instruction"]:
+        template = PromptTemplate(template_name=tname)
+        _eval(f"zero-shot ({tname})", PromptingPipeline(
+            model=model, tokenizer=tokenizer, template=template,
+            device=device, max_length=max_length))
+
     print(f"\nBest prompting strategy: {best_name} ({best_acc:.2%})")
     print(f"Random baseline: 25.00%")
     
