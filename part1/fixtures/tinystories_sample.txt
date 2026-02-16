@@ -1,13 +1,13 @@
 Once upon a time, there was a little girl named Lily. She loved to play in the garden with her dog, Max. One sunny day, Lily found a beautiful butterfly.
 
-"Look, Max!" she said. "Isn't it pretty?"
+    "Look, Max!" she said. "Isn't it pretty?"
 
-The butterfly flew away, and Lily chased it through the flowers. She laughed and played until the sun went down.
+    The butterfly flew away, and Lily chased it through the flowers. She laughed and played until the sun went down.
 
-<|endoftext|>
+    <|endoftext|>
 
-Tom was a curious boy who loved to explore. One day, he found an old map in his grandfather's attic.
+    Tom was a curious boy who loved to explore. One day, he found an old map in his grandfather's attic.
 
-"What's this?" he wondered.
+    "What's this?" he wondered.
 
-The map showed a path to a hidden treasure in the woods behind his house.
+    The map showed a path to a hidden treasure in the woods behind his house.
