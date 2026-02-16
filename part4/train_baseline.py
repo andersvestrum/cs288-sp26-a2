@@ -23,6 +23,7 @@ import argparse
 import json
 import sys
 import torch
+import torch.nn.functional as F
 from pathlib import Path
 
 # Add parent to path for imports
@@ -420,12 +421,46 @@ def finetune_qa(
         log_interval=max(1, len(train_dataloader) // 5),
     )
     
+    # Combined QA + LM loss: preserves language modeling capability during fine-tuning
+    lm_weight = config.get("lm_weight", 0.5)
+
+    def qa_lm_loss_fn(batch, model):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        batch_size, num_choices, seq_len = input_ids.shape
+        flat_ids = input_ids.view(-1, seq_len)
+        flat_mask = attention_mask.view(-1, seq_len)
+
+        # Compute hidden states once (shared between QA and LM objectives)
+        hidden_states = model._get_hidden_states(flat_ids)
+
+        # QA classification loss
+        pooled = model._pool(hidden_states, flat_mask)
+        qa_logits = model.classifier(pooled).squeeze(-1).view(batch_size, num_choices)
+        qa_loss = cross_entropy(qa_logits, labels)
+
+        # Auxiliary LM loss: project hidden states to vocabulary via the tied output head
+        lm_logits = model.transformer.output(hidden_states)
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_labels = flat_ids[:, 1:].contiguous()
+        shift_mask = flat_mask[:, 1:].contiguous().float()
+
+        n, s, v = shift_logits.shape
+        per_token_loss = F.cross_entropy(
+            shift_logits.view(-1, v), shift_labels.view(-1), reduction="none"
+        ).view(n, s)
+        lm_loss = (per_token_loss * shift_mask).sum() / shift_mask.sum().clamp(min=1)
+
+        return qa_loss + lm_weight * lm_loss
+
     # Train
     trainer = Trainer(
         model=qa_model,
         config=train_config,
         train_dataloader=train_dataloader,
-        compute_loss_fn=create_qa_loss_fn(device),
+        compute_loss_fn=qa_lm_loss_fn,
     )
     
     print(f"\nFine-tuning for {config['finetune_epochs']} epoch(s)...")
@@ -620,11 +655,11 @@ Examples:
     print("GRADING RUBRIC")
     print("=" * 60)
     finetuned_score = max(0, min(1, (finetuned_results['accuracy'] - 0.30) / 0.20))
-    prompting_score = max(0, min(1, prompting_boost / 0.04)) if prompting_boost > 0 else 0
-    total_score = 0.5 * finetuned_score + 0.5 * prompting_score
+    prompting_score = max(0, min(1, prompting_boost / 0.02)) if prompting_boost > 0 else 0
+    total_score = 0.6 * finetuned_score + 0.4 * prompting_score
     
-    print(f"\nFine-tuned score:  {finetuned_score:.0%} (30%=0pts, 50%=full)")
-    print(f"Prompting score:   {prompting_score:.0%} (0% boost=0pts, 4% boost=full)")
+    print(f"\nFine-tuned score:  {finetuned_score:.0%} (30%=0pts, 50%=full) [12pts]")
+    print(f"Prompting score:   {prompting_score:.0%} (0% boost=0pts, 2% boost=full) [8pts]")
     print(f"Total Part 4:      {total_score:.0%}")
     
     print("\nDone!")
