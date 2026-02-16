@@ -289,7 +289,7 @@ def evaluate_prompting_all(
     best_acc = -1.0
     best_name = ""
     
-    # --- Likelihood-based strategies (score each choice as a continuation) ---
+    # Likelihood-based strategies (score each choice as a continuation) 
     print("\n  Likelihood-based strategies:")
     likelihood_pipeline = LikelihoodPipeline(
         model=model,
@@ -305,7 +305,7 @@ def evaluate_prompting_all(
         best_results = results
         best_name = "likelihood"
     
-    # --- Token-prediction strategies (predict A/B/C/D) ---
+    # Token-prediction strategies (predict A/B/C/D)
     print("\n  Token-prediction strategies:")
     strategies = [
         ("zero-shot (simple)", PromptTemplate(template_name="simple")),
