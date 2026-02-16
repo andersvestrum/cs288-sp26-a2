@@ -179,6 +179,53 @@ class LikelihoodPipeline:
         return [self.predict_single(ex["context"], ex["question"], ex["choices"]) for ex in examples]
 
 
+class FewShotLikelihoodPipeline(LikelihoodPipeline):
+    """Few-shot version: prepend solved examples, then score each choice by likelihood."""
+    
+    def __init__(self, model, tokenizer, train_examples: List[Dict[str, Any]],
+                 num_shots: int = 2, max_context_chars: int = 150,
+                 device: str = "cuda", max_length: int = 512):
+        super().__init__(model, tokenizer, device=device, max_length=max_length)
+        self.shot_examples = []
+        for ex in train_examples:
+            if len(self.shot_examples) >= num_shots:
+                break
+            if ex.get("answer", -1) >= 0:
+                self.shot_examples.append(ex)
+        self.max_context_chars = max_context_chars
+    
+    def _truncate(self, text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars].rsplit(" ", 1)[0] + "..."
+    
+    def _build_shots_prefix(self) -> str:
+        parts = []
+        for ex in self.shot_examples:
+            ctx = self._truncate(ex["context"], self.max_context_chars)
+            answer_text = ex["choices"][ex["answer"]]
+            parts.append(f"{ctx} {ex['question']} {answer_text}")
+        return "\n\n".join(parts)
+    
+    @torch.no_grad()
+    def predict_single(self, context: str, question: str, choices: List[str], return_probs: bool = False):
+        self.model.eval()
+        shots_prefix = self._build_shots_prefix()
+        prefix = f"{shots_prefix}\n\n{context} {question} "
+        prefix_ids = self.tokenizer.encode(prefix)
+        scores = []
+        for choice_text in choices:
+            completion_ids = self.tokenizer.encode(choice_text)
+            score = self._score_completion(prefix_ids, completion_ids)
+            scores.append(score)
+        scores_t = torch.tensor(scores)
+        probs = softmax(scores_t, dim=-1)
+        prediction = probs.argmax().item()
+        if return_probs:
+            return prediction, probs.tolist()
+        return prediction
+
+
 def evaluate_prompting(pipeline, examples: List[Dict[str, Any]], batch_size: int = 8) -> Dict[str, Any]:
     predictions = pipeline.predict_batch(examples, batch_size)
     correct = sum(1 for p, ex in zip(predictions, examples) if ex.get("answer", -1) >= 0 and p == ex["answer"])

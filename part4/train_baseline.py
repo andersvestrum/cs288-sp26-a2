@@ -35,7 +35,7 @@ from part3.nn_utils import cross_entropy, gradient_clipping
 from part4.datasets import create_pretraining_dataloader, create_qa_dataloader
 from part4.sampling import generate_text
 from part4.qa_model import TransformerForMultipleChoice, evaluate_qa_model
-from part4.prompting import PromptTemplate, FewShotPromptTemplate, PromptingPipeline, LikelihoodPipeline, evaluate_prompting
+from part4.prompting import PromptTemplate, FewShotPromptTemplate, PromptingPipeline, LikelihoodPipeline, FewShotLikelihoodPipeline, evaluate_prompting
 from part4.trainer import Trainer, TrainingConfig, create_qa_loss_fn
 
 
@@ -289,21 +289,34 @@ def evaluate_prompting_all(
     best_acc = -1.0
     best_name = ""
     
-    # Likelihood-based strategies (score each choice as a continuation) 
+    # Likelihood-based strategies (score each choice as a continuation)
     print("\n  Likelihood-based strategies:")
-    likelihood_pipeline = LikelihoodPipeline(
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-        max_length=max_length,
-    )
-    results = eval_prompt(likelihood_pipeline, dev_data)
-    acc = results["accuracy"]
-    print(f"  {'likelihood':30s} -> {acc:.2%}")
-    if acc > best_acc:
-        best_acc = acc
-        best_results = results
-        best_name = "likelihood"
+    likelihood_strategies = [
+        ("likelihood (0-shot)", LikelihoodPipeline(
+            model=model, tokenizer=tokenizer, device=device, max_length=max_length,
+        )),
+        ("likelihood (1-shot)", FewShotLikelihoodPipeline(
+            model=model, tokenizer=tokenizer, train_examples=train_data,
+            num_shots=1, max_context_chars=150, device=device, max_length=max_length,
+        )),
+        ("likelihood (2-shot)", FewShotLikelihoodPipeline(
+            model=model, tokenizer=tokenizer, train_examples=train_data,
+            num_shots=2, max_context_chars=120, device=device, max_length=max_length,
+        )),
+        ("likelihood (3-shot)", FewShotLikelihoodPipeline(
+            model=model, tokenizer=tokenizer, train_examples=train_data,
+            num_shots=3, max_context_chars=100, device=device, max_length=max_length,
+        )),
+    ]
+    
+    for name, pipeline in likelihood_strategies:
+        results = eval_prompt(pipeline, dev_data)
+        acc = results["accuracy"]
+        print(f"  {name:30s} -> {acc:.2%}")
+        if acc > best_acc:
+            best_acc = acc
+            best_results = results
+            best_name = name
     
     # Token-prediction strategies (predict A/B/C/D)
     print("\n  Token-prediction strategies:")
