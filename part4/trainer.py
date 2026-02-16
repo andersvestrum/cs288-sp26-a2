@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any, Callable
 from pathlib import Path
 import time
 import sys
+from tqdm import tqdm
 
 _parent = str(Path(__file__).parent.parent)
 if _parent not in sys.path:
@@ -67,7 +68,8 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         num_batches = 0
-        for batch in self.train_dataloader:
+        pbar = tqdm(self.train_dataloader, desc=f"Training", leave=True)
+        for batch in pbar:
             self.optimizer.zero_grad()
             loss = self.compute_loss_fn(batch, self.model)
             loss.backward()
@@ -77,6 +79,8 @@ class Trainer:
             total_loss += loss.item()
             num_batches += 1
             self.global_step += 1
+            avg_loss = total_loss / num_batches
+            pbar.set_postfix(loss=f"{loss.item():.4f}", avg_loss=f"{avg_loss:.4f}", step=self.global_step)
         return total_loss / num_batches if num_batches > 0 else 0.0
     
     @torch.no_grad()
@@ -94,11 +98,14 @@ class Trainer:
     
     def train(self) -> Dict[str, Any]:
         for epoch in range(self.config.num_epochs):
+            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
             train_loss = self.train_epoch()
             self.train_losses.append(train_loss)
+            print(f"  Train loss: {train_loss:.4f}")
             if self.val_dataloader:
                 val_loss = self.evaluate()
                 self.val_losses.append(val_loss)
+                print(f"  Val loss: {val_loss:.4f}")
         return {"train_losses": self.train_losses, "val_losses": self.val_losses}
 
 
