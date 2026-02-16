@@ -725,8 +725,9 @@ class TransformerLM(nn.Module):
         # Final layer norm
         self.final_ln = RMSNorm(d_model, eps)
         
-        # Output projection (to vocab size)
+        # Output projection, weight-tied with embeddings
         self.output = Linear(d_model, vocab_size)
+        self.output.weight = self.token_embeddings.weight
     
     def forward(self, token_ids: Tensor, token_positions: Optional[Tensor] = None) -> Tensor:
         """
