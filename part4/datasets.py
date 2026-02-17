@@ -7,7 +7,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
-from tqdm import tqdm
 
 
 class PretrainingDataset(Dataset):
@@ -17,15 +16,7 @@ class PretrainingDataset(Dataset):
         self.stride = stride or max_length
         with open(file_path, "r", encoding="utf-8") as f:
             text = f.read()
-        stories = text.split("<|endoftext|>")
-        self.token_ids = []
-        eos_ids = tokenizer.encode("<|endoftext|>")
-        for story in tqdm(stories, desc="Tokenizing stories"):
-            story = story.strip()
-            if story:
-                self.token_ids.extend(tokenizer.encode(story))
-                self.token_ids.extend(eos_ids)
-        print(f"Total tokens: {len(self.token_ids):,}")
+        self.token_ids = tokenizer.encode(text)
         if len(self.token_ids) <= max_length:
             self.num_sequences = 1
         else:
