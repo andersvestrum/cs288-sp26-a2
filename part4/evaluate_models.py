@@ -81,6 +81,7 @@ def get_config(mode: str = "full"):
             "pretrain_epochs": 3,
             "finetune_epochs": 5,
             "batch_size": 4,
+            "qa_batch_size": 2,
             "learning_rate": 1e-3,
             "n_few_shot": 2,
             "max_context_words": 30,
@@ -99,6 +100,8 @@ def get_config(mode: str = "full"):
             "pretrain_epochs": 3,
             "finetune_epochs": 10,
             "batch_size": 16,
+            "qa_batch_size": 4,
+            "grad_accum_steps": 4,
             "learning_rate": 3e-4,
             "n_few_shot": 3,
             "max_context_words": 40,
@@ -198,6 +201,9 @@ def pretrain_model(tokenizer, config: dict, device: str = "cpu") -> TransformerL
 
 def finetune_qa_model(pretrained_model, tokenizer, config: dict, device: str = "cpu") -> TransformerForMultipleChoice:
     """Fine-tune for multiple-choice QA on SQuAD."""
+    if device == "cuda":
+        import gc; gc.collect(); torch.cuda.empty_cache()
+
     print("=" * 60)
     print("Step 3: Fine-tuning QA Model on SQuAD")
     print("=" * 60)
@@ -215,16 +221,21 @@ def finetune_qa_model(pretrained_model, tokenizer, config: dict, device: str = "
     with open(config["qa_train"]) as f:
         train_data = json.load(f)
 
+    # QA batches are 4× larger (one seq per choice), use smaller batch size
+    qa_bs = config.get("qa_batch_size", max(1, config["batch_size"] // 4))
+    grad_accum = config.get("grad_accum_steps", 1)
+
     train_dataloader = create_qa_dataloader(
         data=train_data,
         tokenizer=tokenizer,
-        batch_size=config["batch_size"],
+        batch_size=qa_bs,
         max_length=config["context_length"],
         num_choices=4,
         shuffle=True,
     )
 
     print(f"Training examples: {len(train_data)}, Batches/epoch: {len(train_dataloader)}")
+    print(f"QA batch size: {qa_bs} (×4 choices), grad_accum: {grad_accum}")
 
     from part4.trainer import create_qa_loss_fn
 
@@ -243,6 +254,7 @@ def finetune_qa_model(pretrained_model, tokenizer, config: dict, device: str = "
         config=train_config,
         train_dataloader=train_dataloader,
         compute_loss_fn=create_qa_loss_fn(device),
+        grad_accum_steps=grad_accum,
     )
 
     print("\nTraining...")
@@ -263,10 +275,11 @@ def evaluate_finetuned_model(qa_model, tokenizer, config: dict, device: str = "c
     with open(config["qa_dev"]) as f:
         dev_data = json.load(f)
 
+    qa_bs = config.get("qa_batch_size", max(1, config["batch_size"] // 4))
     dev_dataloader = create_qa_dataloader(
         data=dev_data,
         tokenizer=tokenizer,
-        batch_size=config["batch_size"],
+        batch_size=qa_bs,
         max_length=config["context_length"],
         num_choices=4,
         shuffle=False,

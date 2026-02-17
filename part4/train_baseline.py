@@ -71,13 +71,14 @@ CONFIGS = {
         "pretrain_epochs": 3,
         "finetune_epochs": 5,
         "batch_size": 32,
+        "qa_batch_size": 8,        # 4 choices/example → effective 8×4=32
         "lr": 1e-3,
         "finetune_lr": 5e-4,
         "pooling": "mean",
         "n_few_shot": 2,
         "max_context_words": 30,
     },
-    # ----- small: ~5M params, moderate data -----
+    # ----- small: ~8M params, moderate data -----
     "small": {
         "pretrain_data": Path(__file__).parent / "fixtures/tinystories_100k.txt",
         "qa_train": Path(__file__).parent / "fixtures/squad_train.json",
@@ -91,13 +92,15 @@ CONFIGS = {
         "pretrain_epochs": 3,
         "finetune_epochs": 10,
         "batch_size": 32,
+        "qa_batch_size": 4,        # 4 choices/example → effective 4×4=16 seqs
+        "grad_accum_steps": 4,     # effective QA batch = 4×4=16
         "lr": 3e-4,
         "finetune_lr": 1e-4,
         "pooling": "mean",
         "n_few_shot": 3,
         "max_context_words": 40,
     },
-    # ----- medium: ~15M params, best quality -----
+    # ----- medium: ~25M params, best quality -----
     "medium": {
         "pretrain_data": Path(__file__).parent / "fixtures/tinystories_100k.txt",
         "qa_train": Path(__file__).parent / "fixtures/squad_train.json",
@@ -111,6 +114,8 @@ CONFIGS = {
         "pretrain_epochs": 5,
         "finetune_epochs": 15,
         "batch_size": 16,
+        "qa_batch_size": 2,        # 4 choices/example → effective 2×4=8 seqs
+        "grad_accum_steps": 8,     # effective QA batch = 2×8=16
         "lr": 1e-4,
         "finetune_lr": 5e-5,
         "pooling": "mean",
@@ -131,6 +136,8 @@ CONFIGS = {
         "pretrain_epochs": 3,
         "finetune_epochs": 15,
         "batch_size": 16,
+        "qa_batch_size": 4,        # 4 choices/example → effective 4×4=16 seqs
+        "grad_accum_steps": 4,     # effective QA batch = 4×4=16
         "lr": 3e-4,
         "finetune_lr": 5e-5,
         "pooling": "mean",
@@ -271,7 +278,14 @@ def finetune_qa(
 
     Adds a classification head that pools transformer hidden states
     and predicts the correct answer among 4 choices.
+
+    NOTE: QA batches are 4× larger than LM batches (one forward pass per
+    choice), so we use a smaller qa_batch_size and gradient accumulation.
     """
+    # Free pretraining optimizer/scheduler memory before creating new ones
+    if device == "cuda":
+        import gc; gc.collect(); torch.cuda.empty_cache()
+
     print("\n" + "=" * 60)
     print("STEP 3 [4A]: Fine-tuning for Multiple-Choice QA")
     print("=" * 60)
@@ -292,10 +306,14 @@ def finetune_qa(
     with open(config["qa_train"]) as f:
         train_data = json.load(f)
 
+    # Use smaller batch size for QA (each example = 4 forward passes)
+    qa_bs = config.get("qa_batch_size", max(1, config["batch_size"] // 4))
+    grad_accum = config.get("grad_accum_steps", 1)
+
     train_dataloader = create_qa_dataloader(
         data=train_data,
         tokenizer=tokenizer,
-        batch_size=config["batch_size"],
+        batch_size=qa_bs,
         max_length=config["context_length"],
         num_choices=4,
         shuffle=True,
@@ -303,6 +321,8 @@ def finetune_qa(
 
     print(f"\nTraining data: {config['qa_train']}")
     print(f"  Examples: {len(train_data)}")
+    print(f"  QA batch size: {qa_bs}  (×4 choices = {qa_bs * 4} seqs/step)")
+    print(f"  Grad accumulation: {grad_accum}  (effective batch = {qa_bs * grad_accum})")
     print(f"  Batches/epoch: {len(train_dataloader)}")
 
     finetune_lr = config.get("finetune_lr", config["lr"] / 2)
@@ -322,6 +342,7 @@ def finetune_qa(
         config=train_config,
         train_dataloader=train_dataloader,
         compute_loss_fn=create_qa_loss_fn(device),
+        grad_accum_steps=grad_accum,
     )
 
     print(f"\nFine-tuning for {config['finetune_epochs']} epoch(s) at lr={finetune_lr}...")
@@ -348,10 +369,11 @@ def evaluate_finetuned(
     with open(config["qa_dev"]) as f:
         dev_data = json.load(f)
 
+    qa_bs = config.get("qa_batch_size", max(1, config["batch_size"] // 4))
     dev_dataloader = create_qa_dataloader(
         data=dev_data,
         tokenizer=tokenizer,
-        batch_size=config["batch_size"],
+        batch_size=qa_bs,
         max_length=config["context_length"],
         num_choices=4,
         shuffle=False,

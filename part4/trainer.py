@@ -4,6 +4,7 @@ Training utilities for pre-training and fine-tuning.
 Provides:
   - TrainingConfig: Dataclass for hyperparameters
   - Trainer: Training loop with AdamW + cosine schedule + gradient clipping
+             + optional gradient accumulation
   - create_qa_loss_fn: Loss function factory for QA fine-tuning
 """
 import torch
@@ -50,7 +51,8 @@ class Trainer:
     Generic trainer for both LM pre-training and QA fine-tuning.
 
     Uses AdamW with linear warmup followed by cosine decay.
-    Supports a custom loss function for different tasks.
+    Supports a custom loss function for different tasks and
+    gradient accumulation for memory-constrained fine-tuning.
     """
 
     def __init__(
@@ -60,12 +62,14 @@ class Trainer:
         train_dataloader: DataLoader,
         val_dataloader: Optional[DataLoader] = None,
         compute_loss_fn: Optional[Callable] = None,
+        grad_accum_steps: int = 1,
     ):
         self.model = model.to(config.device)
         self.config = config
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
         self.compute_loss_fn = compute_loss_fn or self._default_lm_loss
+        self.grad_accum_steps = max(1, grad_accum_steps)
 
         self.optimizer = AdamW(
             model.parameters(),
@@ -73,13 +77,15 @@ class Trainer:
             weight_decay=config.weight_decay,
         )
 
-        total_steps = len(train_dataloader) * config.num_epochs
-        if config.warmup_steps > 0 and total_steps > config.warmup_steps:
+        # Scheduler counts *optimizer* steps (after accumulation)
+        steps_per_epoch = len(train_dataloader) // self.grad_accum_steps
+        total_optim_steps = steps_per_epoch * config.num_epochs
+        if config.warmup_steps > 0 and total_optim_steps > config.warmup_steps:
             warmup = LinearLR(self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=config.warmup_steps)
-            main = CosineAnnealingLR(self.optimizer, T_max=max(1, total_steps - config.warmup_steps))
+            main = CosineAnnealingLR(self.optimizer, T_max=max(1, total_optim_steps - config.warmup_steps))
             self.scheduler = SequentialLR(self.optimizer, [warmup, main], milestones=[config.warmup_steps])
         else:
-            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max(1, total_steps))
+            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=max(1, total_optim_steps))
 
         self.global_step = 0
         self.best_val_loss = float("inf")
@@ -95,7 +101,7 @@ class Trainer:
         return cross_entropy(logits.view(-1, vocab_size), labels.view(-1))
 
     def train_epoch(self) -> float:
-        """Run one training epoch with progress bar and logging."""
+        """Run one training epoch with progress bar, logging, and gradient accumulation."""
         self.model.train()
         total_loss = 0.0
         num_batches = 0
@@ -104,21 +110,31 @@ class Trainer:
         if tqdm is not None:
             loader = tqdm(loader, desc="Training", leave=True)
 
-        for batch in loader:
-            self.optimizer.zero_grad()
-            loss = self.compute_loss_fn(batch, self.model)
-            loss.backward()
-            gradient_clipping(self.model.parameters(), self.config.max_grad_norm)
-            self.optimizer.step()
-            self.scheduler.step()
+        self.optimizer.zero_grad()
 
-            total_loss += loss.item()
+        for batch_idx, batch in enumerate(loader):
+            loss = self.compute_loss_fn(batch, self.model)
+
+            # Scale loss by accumulation steps so the total gradient is averaged
+            if self.grad_accum_steps > 1:
+                loss = loss / self.grad_accum_steps
+
+            loss.backward()
+
+            total_loss += loss.item() * self.grad_accum_steps  # track unscaled loss
             num_batches += 1
-            self.global_step += 1
+
+            # Optimizer step every grad_accum_steps micro-batches (or at end of epoch)
+            if (batch_idx + 1) % self.grad_accum_steps == 0 or (batch_idx + 1) == len(self.train_dataloader):
+                gradient_clipping(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                self.global_step += 1
 
             if tqdm is not None and hasattr(loader, 'set_postfix'):
                 loader.set_postfix(
-                    loss=f"{loss.item():.4f}",
+                    loss=f"{loss.item() * self.grad_accum_steps:.4f}",
                     avg_loss=f"{total_loss / num_batches:.4f}",
                     step=self.global_step,
                 )
@@ -141,8 +157,9 @@ class Trainer:
 
     def train(self) -> Dict[str, Any]:
         """Full training loop over all epochs."""
+        accum_msg = f", grad_accum={self.grad_accum_steps}" if self.grad_accum_steps > 1 else ""
         print(f"\nStarting training: {self.config.num_epochs} epochs, "
-              f"lr={self.config.learning_rate}, device={self.config.device}")
+              f"lr={self.config.learning_rate}, device={self.config.device}{accum_msg}")
 
         for epoch in range(self.config.num_epochs):
             print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
