@@ -1,7 +1,14 @@
 """
 Prompting utilities for multiple-choice QA.
-Example submission.
+
+Provides:
+  - PromptTemplate: Zero-shot prompt formatting (basic/instruction/simple)
+  - FewShotPromptTemplate: Few-shot prompt formatting with in-context examples
+  - PromptingPipeline: Next-token (A/B/C/D) prediction pipeline
+  - PerplexityScoringPipeline: Scores each choice by log-likelihood
+  - evaluate_prompting: Evaluation helper
 """
+import random
 import torch
 from torch import Tensor
 from typing import List, Dict, Any, Optional
@@ -15,24 +22,30 @@ if _parent not in sys.path:
 from part3.nn_utils import softmax
 
 
+# =============================================================================
+# Prompt Templates
+# =============================================================================
+
 class PromptTemplate:
+    """Zero-shot prompt template for multiple-choice QA."""
+
     TEMPLATES = {
         "basic": "Context: {context}\n\nQuestion: {question}\n\nChoices:\n{choices_formatted}\n\nAnswer:",
         "instruction": "Read the following passage and answer the question.\n\nPassage: {context}\n\nQuestion: {question}\n\n{choices_formatted}\n\nSelect the letter:",
         "simple": "{context}\n{question}\n{choices_formatted}\nThe answer is",
     }
-    
+
     def __init__(self, template_name: str = "basic", custom_template: Optional[str] = None, choice_format: str = "letter"):
         self.template = custom_template if custom_template else self.TEMPLATES.get(template_name, self.TEMPLATES["basic"])
         self.choice_format = choice_format
-    
+
     def _format_choices(self, choices: List[str]) -> str:
-        labels = ["A", "B", "C", "D", "E", "F", "G", "H"] if self.choice_format == "letter" else [str(i+1) for i in range(len(choices))]
+        labels = ["A", "B", "C", "D", "E", "F", "G", "H"] if self.choice_format == "letter" else [str(i + 1) for i in range(len(choices))]
         return "\n".join(f"{l}. {c}" for l, c in zip(labels, choices))
-    
+
     def format(self, context: str, question: str, choices: List[str], **kwargs) -> str:
         return self.template.format(context=context, question=question, choices_formatted=self._format_choices(choices), **kwargs)
-    
+
     def format_with_answer(self, context: str, question: str, choices: List[str], answer_idx: int) -> str:
         prompt = self.format(context, question, choices)
         label = chr(ord('A') + answer_idx) if self.choice_format == "letter" else str(answer_idx + 1)
@@ -40,50 +53,116 @@ class PromptTemplate:
 
 
 class FewShotPromptTemplate(PromptTemplate):
-    """Prompt template that includes few-shot examples before the test question."""
-    
-    def __init__(self, examples: List[Dict[str, Any]], num_shots: int = 2,
-                 max_context_chars: int = 150, template_name: str = "simple", **kwargs):
-        super().__init__(template_name=template_name, **kwargs)
-        self.shot_examples = []
-        for ex in examples:
-            if len(self.shot_examples) >= num_shots:
-                break
-            if ex.get("answer", -1) >= 0:
-                self.shot_examples.append(ex)
-        self.max_context_chars = max_context_chars
-    
-    def _truncate_context(self, text: str, max_chars: int) -> str:
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars].rsplit(" ", 1)[0] + "..."
-    
+    """
+    Few-shot prompt template that prepends solved examples before the test question.
+
+    The in-context examples teach the model the expected QA pattern:
+        [Example 1 context + question + choices -> answer letter]
+        [Example 2 context + question + choices -> answer letter]
+        [Test context + question + choices -> ???]
+
+    Args:
+        n_examples: Number of few-shot examples to include.
+        train_examples: List of training examples to draw from.
+        max_context_words: Maximum words to keep from each example context (truncation).
+        seed: Random seed for reproducible example selection.
+        choice_format: "letter" for A/B/C/D or "number" for 1/2/3/4.
+    """
+
+    def __init__(
+        self,
+        n_examples: int = 3,
+        train_examples: Optional[List[Dict[str, Any]]] = None,
+        max_context_words: int = 40,
+        seed: int = 42,
+        choice_format: str = "letter",
+    ):
+        super().__init__(template_name="basic", choice_format=choice_format)
+        self.n_examples = n_examples
+        self.train_examples = train_examples or []
+        self.max_context_words = max_context_words
+        self.seed = seed
+        self._selected_examples: Optional[List[Dict]] = None
+
+    def _truncate_text(self, text: str, max_words: int) -> str:
+        """Truncate text to max_words, adding ellipsis if truncated."""
+        words = text.split()
+        if len(words) > max_words:
+            return " ".join(words[:max_words]) + "..."
+        return text
+
+    def _select_examples(self) -> List[Dict[str, Any]]:
+        """Select few-shot examples (cached after first call for consistency)."""
+        if self._selected_examples is not None:
+            return self._selected_examples
+        if not self.train_examples:
+            self._selected_examples = []
+            return self._selected_examples
+
+        rng = random.Random(self.seed)
+        # Prefer examples with shorter contexts so they fit within token budget
+        sorted_by_length = sorted(self.train_examples, key=lambda x: len(x.get("context", "")))
+        pool_size = min(len(sorted_by_length), self.n_examples * 20)
+        pool = sorted_by_length[:pool_size]
+        n = min(self.n_examples, len(pool))
+        self._selected_examples = rng.sample(pool, n)
+        return self._selected_examples
+
+    def _format_solved_example(self, example: Dict[str, Any]) -> str:
+        """Format a single solved example as: context -> question -> choices -> answer."""
+        ctx = self._truncate_text(example["context"], self.max_context_words)
+        question = example["question"]
+        choices = example["choices"]
+        answer_label = chr(ord('A') + example["answer"])
+        choices_text = self._format_choices(choices)
+        return f"Context: {ctx}\nQuestion: {question}\n{choices_text}\nAnswer: {answer_label}"
+
     def format(self, context: str, question: str, choices: List[str], **kwargs) -> str:
-        parts = []
-        for ex in self.shot_examples:
-            ctx = self._truncate_context(ex["context"], self.max_context_chars)
-            shot_prompt = super().format(ctx, ex["question"], ex["choices"])
-            answer_label = chr(ord('A') + ex["answer"])
-            parts.append(f"{shot_prompt} {answer_label}")
-        
-        test_ctx = self._truncate_context(context, self.max_context_chars * 2)
-        test_prompt = super().format(test_ctx, question, choices)
-        parts.append(test_prompt)
-        
+        """Build the full few-shot prompt: examples + test question."""
+        examples = self._select_examples()
+        parts = [self._format_solved_example(ex) for ex in examples]
+
+        choices_text = self._format_choices(choices)
+        parts.append(f"Context: {context}\nQuestion: {question}\n{choices_text}\nAnswer:")
         return "\n\n".join(parts)
 
+    def reset_cache(self):
+        """Clear cached examples so next format() re-selects."""
+        self._selected_examples = None
+
+
+# =============================================================================
+# Prompting Pipelines
+# =============================================================================
 
 class PromptingPipeline:
-    def __init__(self, model, tokenizer, template: Optional[PromptTemplate] = None,
-                 device: str = "cuda", max_length: int = 512):
+    """
+    Zero-shot / few-shot prompting pipeline using next-token prediction.
+
+    For each QA example the pipeline:
+      1. Formats the prompt using the template.
+      2. Feeds the prompt through the LM.
+      3. Reads logits at the last position for tokens A, B, C, D.
+      4. Predicts the choice with the highest probability.
+    """
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        template: Optional[PromptTemplate] = None,
+        device: str = "cuda",
+        max_length: int = 512,
+    ):
         self.model = model.to(device) if hasattr(model, 'to') else model
         self.tokenizer = tokenizer
         self.template = template or PromptTemplate("basic")
         self.device = device
         self.max_length = max_length
         self._setup_choice_tokens()
-    
+
     def _setup_choice_tokens(self):
+        """Find token IDs that correspond to answer letters A, B, C, D."""
         self.choice_tokens = {}
         for label in ["A", "B", "C", "D"]:
             for prefix in ["", " "]:
@@ -91,17 +170,21 @@ class PromptingPipeline:
                 if token_ids:
                     self.choice_tokens[label] = token_ids[-1]
                     break
-    
+
     @torch.no_grad()
     def predict_single(self, context: str, question: str, choices: List[str], return_probs: bool = False):
+        """Predict the answer for a single QA example."""
         self.model.eval()
         prompt = self.template.format(context, question, choices)
-        token_ids = self.tokenizer.encode(prompt)
-        if len(token_ids) > self.max_length:
-            token_ids = token_ids[:self.max_length]
-        input_ids = torch.tensor([token_ids], device=self.device)
-        logits = self.model(input_ids)[:, -1, :]
-        
+        input_ids = self.tokenizer.encode(prompt)
+
+        # Truncate from the beginning to fit context_length (keep the end = test question)
+        if len(input_ids) > self.max_length:
+            input_ids = input_ids[-self.max_length:]
+
+        input_tensor = torch.tensor([input_ids], device=self.device)
+        logits = self.model(input_tensor)[:, -1, :]
+
         choice_labels = ["A", "B", "C", "D"][:len(choices)]
         choice_logits = []
         for label in choice_labels:
@@ -109,129 +192,32 @@ class PromptingPipeline:
                 choice_logits.append(logits[0, self.choice_tokens[label]].item())
             else:
                 choice_logits.append(float("-inf"))
-        
+
         choice_logits = torch.tensor(choice_logits)
         probs = softmax(choice_logits, dim=-1)
         prediction = probs.argmax().item()
-        
+
         if return_probs:
             return prediction, probs.tolist()
         return prediction
-    
+
     @torch.no_grad()
     def predict_batch(self, examples: List[Dict[str, Any]], batch_size: int = 8) -> List[int]:
+        """Predict answers for a batch of QA examples (processed sequentially)."""
         return [self.predict_single(ex["context"], ex["question"], ex["choices"]) for ex in examples]
 
 
-class LikelihoodPipeline:
-    """Score each answer choice by how likely the model thinks it is as a continuation."""
-    
-    def __init__(self, model, tokenizer, device: str = "cuda", max_length: int = 512):
-        self.model = model.to(device) if hasattr(model, 'to') else model
-        self.tokenizer = tokenizer
-        self.device = device
-        self.max_length = max_length
-    
-    @torch.no_grad()
-    def _score_completion(self, prefix_ids: List[int], completion_ids: List[int]) -> float:
-        """Compute average log-prob of completion_ids given prefix_ids."""
-        if not completion_ids:
-            return float("-inf")
-        all_ids = prefix_ids + completion_ids
-        if len(all_ids) > self.max_length:
-            trim = len(all_ids) - self.max_length
-            all_ids = all_ids[trim:]
-            start = max(0, len(prefix_ids) - trim)
-        else:
-            start = len(prefix_ids)
-        if start >= len(all_ids):
-            return float("-inf")
-        input_ids = torch.tensor([all_ids], device=self.device)
-        logits = self.model(input_ids)
-        log_probs = torch.log_softmax(logits[0], dim=-1)
-        total = 0.0
-        count = 0
-        for i in range(start, len(all_ids)):
-            token_id = all_ids[i]
-            total += log_probs[i - 1, token_id].item()
-            count += 1
-        return total / count if count > 0 else float("-inf")
-    
-    @torch.no_grad()
-    def predict_single(self, context: str, question: str, choices: List[str], return_probs: bool = False):
-        self.model.eval()
-        prefix = f"{context} {question} "
-        prefix_ids = self.tokenizer.encode(prefix)
-        scores = []
-        for choice_text in choices:
-            completion_ids = self.tokenizer.encode(choice_text)
-            score = self._score_completion(prefix_ids, completion_ids)
-            scores.append(score)
-        scores_t = torch.tensor(scores)
-        probs = softmax(scores_t, dim=-1)
-        prediction = probs.argmax().item()
-        if return_probs:
-            return prediction, probs.tolist()
-        return prediction
-    
-    @torch.no_grad()
-    def predict_batch(self, examples: List[Dict[str, Any]], batch_size: int = 8) -> List[int]:
-        return [self.predict_single(ex["context"], ex["question"], ex["choices"]) for ex in examples]
+class PerplexityScoringPipeline:
+    """
+    Alternative prompting approach: score each choice by log-likelihood.
 
+    Instead of predicting A/B/C/D tokens, this pipeline:
+      1. For each choice, creates text: "context question answer: <choice>"
+      2. Computes the average log-probability of the choice tokens.
+      3. Selects the choice with the highest average log-probability.
 
-class FewShotLikelihoodPipeline(LikelihoodPipeline):
-    """Few-shot version: prepend solved examples, then score each choice by likelihood."""
-    
-    def __init__(self, model, tokenizer, train_examples: List[Dict[str, Any]],
-                 num_shots: int = 2, max_context_chars: int = 150,
-                 device: str = "cuda", max_length: int = 512):
-        super().__init__(model, tokenizer, device=device, max_length=max_length)
-        self.shot_examples = []
-        for ex in train_examples:
-            if len(self.shot_examples) >= num_shots:
-                break
-            if ex.get("answer", -1) >= 0:
-                self.shot_examples.append(ex)
-        self.max_context_chars = max_context_chars
-    
-    def _truncate(self, text: str, max_chars: int) -> str:
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars].rsplit(" ", 1)[0] + "..."
-    
-    def _build_shots_prefix(self) -> str:
-        parts = []
-        for ex in self.shot_examples:
-            ctx = self._truncate(ex["context"], self.max_context_chars)
-            answer_text = ex["choices"][ex["answer"]]
-            parts.append(f"{ctx} {ex['question']} {answer_text}")
-        return "\n\n".join(parts)
-    
-    @torch.no_grad()
-    def predict_single(self, context: str, question: str, choices: List[str], return_probs: bool = False):
-        self.model.eval()
-        shots_prefix = self._build_shots_prefix()
-        prefix = f"{shots_prefix}\n\n{context} {question} "
-        prefix_ids = self.tokenizer.encode(prefix)
-        scores = []
-        for choice_text in choices:
-            completion_ids = self.tokenizer.encode(choice_text)
-            score = self._score_completion(prefix_ids, completion_ids)
-            scores.append(score)
-        scores_t = torch.tensor(scores)
-        probs = softmax(scores_t, dim=-1)
-        prediction = probs.argmax().item()
-        if return_probs:
-            return prediction, probs.tolist()
-        return prediction
-
-
-class MatchedFormatLikelihoodPipeline:
-    """Score each choice using the EXACT format from fine-tuning:
-    {context}\\n\\nQuestion: {question}\\n\\nAnswer: {choice}
-
-    Context is truncated (not question/answer) to fit within max_length.
-    This matches MultipleChoiceQADataset._format_choice_input exactly.
+    This can outperform token-prediction when the model hasn't learned
+    the A/B/C/D mapping, since it leverages raw language modeling ability.
     """
 
     def __init__(self, model, tokenizer, device: str = "cuda", max_length: int = 512):
@@ -240,217 +226,89 @@ class MatchedFormatLikelihoodPipeline:
         self.device = device
         self.max_length = max_length
 
-    def _prepare_ids(self, context: str, question: str, choice: str):
-        """Tokenize with smart truncation: trim context to preserve Q&A."""
-        qa_suffix = f"\n\nQuestion: {question}\n\nAnswer: "
-        qa_suffix_ids = self.tokenizer.encode(qa_suffix)
-        choice_ids = self.tokenizer.encode(choice)
-
-        max_ctx = max(0, self.max_length - len(qa_suffix_ids) - len(choice_ids))
-        context_ids = self.tokenizer.encode(context)
-        if len(context_ids) > max_ctx:
-            context_ids = context_ids[:max_ctx]
-
-        full_ids = context_ids + qa_suffix_ids + choice_ids
-        answer_start = len(context_ids) + len(qa_suffix_ids)
-        return full_ids, answer_start
-
     @torch.no_grad()
-    def _score_choice(self, context: str, question: str, choice: str) -> float:
-        full_ids, answer_start = self._prepare_ids(context, question, choice)
-        if answer_start >= len(full_ids):
-            return float("-inf")
-
-        input_ids = torch.tensor([full_ids], device=self.device)
-        logits = self.model(input_ids)
-        log_probs = torch.log_softmax(logits[0], dim=-1)
-
-        total = 0.0
-        count = 0
-        for i in range(answer_start, len(full_ids)):
-            total += log_probs[i - 1, full_ids[i]].item()
-            count += 1
-        return total / max(count, 1)
-
-    @torch.no_grad()
-    def predict_single(self, context: str, question: str, choices: List[str],
-                       return_probs: bool = False):
-        self.model.eval()
-        scores = [self._score_choice(context, question, c) for c in choices]
-        scores_t = torch.tensor(scores)
-        probs = softmax(scores_t, dim=-1)
-        prediction = probs.argmax().item()
-        if return_probs:
-            return prediction, probs.tolist()
-        return prediction
-
-    @torch.no_grad()
-    def predict_batch(self, examples: List[Dict[str, Any]], batch_size: int = 8) -> List[int]:
-        return [self.predict_single(ex["context"], ex["question"], ex["choices"])
-                for ex in examples]
-
-
-class CalibratedLikelihoodPipeline(MatchedFormatLikelihoodPipeline):
-    """PMI-calibrated scoring: score = P(choice|ctx,q) - P(choice|neutral).
-    Removes prior bias toward frequent tokens."""
-
-    def __init__(self, model, tokenizer, device: str = "cuda", max_length: int = 512,
-                 calibration_context: str = "N/A"):
-        super().__init__(model, tokenizer, device, max_length)
-        self.cal_ctx = calibration_context
-        self._prior_cache: Dict[str, float] = {}
-
-    def _score_prior(self, choice: str) -> float:
-        if choice not in self._prior_cache:
-            self._prior_cache[choice] = self._score_choice(
-                self.cal_ctx, self.cal_ctx, choice)
-        return self._prior_cache[choice]
-
-    @torch.no_grad()
-    def predict_single(self, context: str, question: str, choices: List[str],
-                       return_probs: bool = False):
+    def predict_single(self, context: str, question: str, choices: List[str], return_scores: bool = False):
+        """Score each choice by log-likelihood and return the best."""
         self.model.eval()
         scores = []
-        for c in choices:
-            actual = self._score_choice(context, question, c)
-            prior = self._score_prior(c)
-            scores.append(actual - prior)
-        scores_t = torch.tensor(scores)
-        probs = softmax(scores_t, dim=-1)
-        prediction = probs.argmax().item()
-        if return_probs:
-            return prediction, probs.tolist()
-        return prediction
 
+        for choice in choices:
+            prefix_text = f"{context}\n\nQuestion: {question}\nAnswer: "
+            full_text = prefix_text + choice
 
-class FewShotMatchedLikelihoodPipeline:
-    """Few-shot likelihood scoring with matched fine-tuning format.
-    Prepends solved QA examples (in fine-tuning format), then scores each choice.
-    Selects examples with shortest contexts to maximize token budget."""
+            prefix_ids = self.tokenizer.encode(prefix_text)
+            full_ids = self.tokenizer.encode(full_text)
+            choice_start = len(prefix_ids)
 
-    def __init__(self, model, tokenizer, train_examples: List[Dict[str, Any]],
-                 num_shots: int = 2, device: str = "cuda", max_length: int = 512,
-                 max_shot_tokens: int = 80):
-        self.model = model.to(device) if hasattr(model, 'to') else model
-        self.tokenizer = tokenizer
-        self.device = device
-        self.max_length = max_length
+            # Truncate prefix from beginning if needed
+            if len(full_ids) > self.max_length:
+                excess = len(full_ids) - self.max_length
+                full_ids = full_ids[excess:]
+                choice_start = max(0, choice_start - excess)
 
-        valid = [ex for ex in train_examples if ex.get("answer", -1) >= 0]
-        valid.sort(key=lambda ex: len(ex.get("context", "")))
-        self.shot_examples = valid[:num_shots]
-        self.max_shot_tokens = max_shot_tokens
-        self._shots_ids = self._build_shots()
+            if choice_start >= len(full_ids) or choice_start < 1:
+                scores.append(float("-inf"))
+                continue
 
-    def _build_shots(self) -> List[int]:
-        sep = self.tokenizer.encode("\n\n")
-        all_ids: List[int] = []
-        for i, ex in enumerate(self.shot_examples):
-            if i > 0:
-                all_ids.extend(sep)
-            ctx_ids = self.tokenizer.encode(ex["context"])
-            qa = f"\n\nQuestion: {ex['question']}\n\nAnswer: {ex['choices'][ex['answer']]}"
-            qa_ids = self.tokenizer.encode(qa)
-            budget = max(0, self.max_shot_tokens - len(qa_ids))
-            if len(ctx_ids) > budget:
-                ctx_ids = ctx_ids[:budget]
-            all_ids.extend(ctx_ids + qa_ids)
-        return all_ids
+            input_tensor = torch.tensor([full_ids], device=self.device)
+            logits = self.model(input_tensor)
 
-    @torch.no_grad()
-    def _score_choice(self, context: str, question: str, choice: str) -> float:
-        self.model.eval()
-        sep = self.tokenizer.encode("\n\n")
-        qa_suffix_ids = self.tokenizer.encode(f"\n\nQuestion: {question}\n\nAnswer: ")
-        choice_ids = self.tokenizer.encode(choice)
+            # Compute average log-prob of choice tokens
+            log_probs = torch.log_softmax(logits[0], dim=-1)
+            token_log_probs = []
+            for i in range(choice_start, len(full_ids)):
+                token_id = full_ids[i]
+                # logits at position i-1 predict token at position i
+                token_log_probs.append(log_probs[i - 1, token_id].item())
 
-        fixed = len(self._shots_ids) + len(sep) + len(qa_suffix_ids) + len(choice_ids)
-        max_ctx = max(0, self.max_length - fixed)
-        ctx_ids = self.tokenizer.encode(context)
-        if len(ctx_ids) > max_ctx:
-            ctx_ids = ctx_ids[:max_ctx]
+            score = sum(token_log_probs) / len(token_log_probs) if token_log_probs else float("-inf")
+            scores.append(score)
 
-        full_ids = self._shots_ids + sep + ctx_ids + qa_suffix_ids + choice_ids
-        answer_start = len(full_ids) - len(choice_ids)
-
-        if len(full_ids) > self.max_length:
-            full_ids = full_ids[:self.max_length]
-        if answer_start >= len(full_ids) or answer_start < 1:
-            return float("-inf")
-
-        input_ids = torch.tensor([full_ids], device=self.device)
-        logits = self.model(input_ids)
-        log_probs = torch.log_softmax(logits[0], dim=-1)
-
-        total = 0.0
-        count = 0
-        for i in range(answer_start, len(full_ids)):
-            total += log_probs[i - 1, full_ids[i]].item()
-            count += 1
-        return total / max(count, 1)
-
-    @torch.no_grad()
-    def predict_single(self, context: str, question: str, choices: List[str],
-                       return_probs: bool = False):
-        scores = [self._score_choice(context, question, c) for c in choices]
-        scores_t = torch.tensor(scores)
-        probs = softmax(scores_t, dim=-1)
-        prediction = probs.argmax().item()
-        if return_probs:
-            return prediction, probs.tolist()
+        prediction = scores.index(max(scores))
+        if return_scores:
+            return prediction, scores
         return prediction
 
     @torch.no_grad()
     def predict_batch(self, examples: List[Dict[str, Any]], batch_size: int = 8) -> List[int]:
-        return [self.predict_single(ex["context"], ex["question"], ex["choices"])
-                for ex in examples]
+        return [self.predict_single(ex["context"], ex["question"], ex["choices"]) for ex in examples]
 
 
-class CalibratedFewShotMatchedPipeline:
-    """Combines few-shot matched format with PMI calibration.
-    Uses few-shot examples for context, then calibrates to remove prior bias."""
+class EnsemblePipeline:
+    """
+    Ensemble of prompting + perplexity scoring for improved accuracy.
 
-    def __init__(self, model, tokenizer, train_examples: List[Dict[str, Any]],
-                 num_shots: int = 2, device: str = "cuda", max_length: int = 512,
-                 max_shot_tokens: int = 80, calibration_context: str = "N/A"):
-        self.fewshot = FewShotMatchedLikelihoodPipeline(
-            model, tokenizer, train_examples, num_shots, device, max_length, max_shot_tokens)
-        self.matched = MatchedFormatLikelihoodPipeline(model, tokenizer, device, max_length)
-        self.cal_ctx = calibration_context
-        self._prior_cache: Dict[str, float] = {}
-        self.model = self.fewshot.model
-        self.tokenizer = tokenizer
-        self.device = device
+    Combines predictions from a PromptingPipeline and a PerplexityScoringPipeline
+    by averaging their probability/score distributions.
+    """
 
-    def _score_prior(self, choice: str) -> float:
-        if choice not in self._prior_cache:
-            self._prior_cache[choice] = self.matched._score_choice(
-                self.cal_ctx, self.cal_ctx, choice)
-        return self._prior_cache[choice]
+    def __init__(self, prompt_pipeline: PromptingPipeline, ppl_pipeline: PerplexityScoringPipeline, weight_prompt: float = 0.5):
+        self.prompt_pipeline = prompt_pipeline
+        self.ppl_pipeline = ppl_pipeline
+        self.weight_prompt = weight_prompt
 
-    @torch.no_grad()
-    def predict_single(self, context: str, question: str, choices: List[str],
-                       return_probs: bool = False):
-        self.model.eval()
-        scores = []
-        for c in choices:
-            actual = self.fewshot._score_choice(context, question, c)
-            prior = self._score_prior(c)
-            scores.append(actual - prior)
-        scores_t = torch.tensor(scores)
-        probs = softmax(scores_t, dim=-1)
-        prediction = probs.argmax().item()
-        if return_probs:
-            return prediction, probs.tolist()
-        return prediction
+    def predict_single(self, context: str, question: str, choices: List[str]):
+        _, probs = self.prompt_pipeline.predict_single(context, question, choices, return_probs=True)
+        _, scores = self.ppl_pipeline.predict_single(context, question, choices, return_scores=True)
 
-    @torch.no_grad()
+        # Normalise perplexity scores to probabilities
+        score_tensor = torch.tensor(scores)
+        score_probs = softmax(score_tensor, dim=-1).tolist()
+
+        # Weighted combination
+        combined = [self.weight_prompt * p + (1 - self.weight_prompt) * s for p, s in zip(probs, score_probs)]
+        return combined.index(max(combined))
+
     def predict_batch(self, examples: List[Dict[str, Any]], batch_size: int = 8) -> List[int]:
-        return [self.predict_single(ex["context"], ex["question"], ex["choices"])
-                for ex in examples]
+        return [self.predict_single(ex["context"], ex["question"], ex["choices"]) for ex in examples]
 
+
+# =============================================================================
+# Evaluation
+# =============================================================================
 
 def evaluate_prompting(pipeline, examples: List[Dict[str, Any]], batch_size: int = 8) -> Dict[str, Any]:
+    """Evaluate a prompting pipeline on QA examples and return accuracy + predictions."""
     predictions = pipeline.predict_batch(examples, batch_size)
     correct = sum(1 for p, ex in zip(predictions, examples) if ex.get("answer", -1) >= 0 and p == ex["answer"])
     total = sum(1 for ex in examples if ex.get("answer", -1) >= 0)

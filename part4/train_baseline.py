@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
 """
-Part 4 Baseline Training Script
+Part 4 Training Script — Pre-train, Fine-tune, and Prompt.
 
-This script demonstrates how to:
-1. Train a BPE tokenizer on TinyStories
-2. Pretrain a Transformer LM for next-token prediction
-3. Fine-tune the model for multiple-choice QA
-4. Evaluate using both prompting and fine-tuning approaches
+Pipeline
+--------
+  1. Train BPE tokenizer on TinyStories
+  2. Pre-train Transformer LM (next-token prediction)
+  3. [4A] Fine-tune for multiple-choice QA  → finetuned_predictions.json
+  4. [4B] Evaluate few-shot prompting       → prompting_predictions.json
 
-Students can use this as a reference for their implementations.
-
-Usage:
-    # First, download datasets
+Usage
+-----
+    # Download datasets first
     python part4/setup_datasets.py
-    
-    # Then run training (use --quick for testing)
-    python part4/train_baseline.py --quick      # Quick test (~2 min)
-    python part4/train_baseline.py              # Full training (~30 min on GPU)
+
+    # Quick sanity check  (~2 min, tiny model)
+    python part4/train_baseline.py --quick
+
+    # Optimized run       (~20-40 min on GPU)
+    python part4/train_baseline.py --optimized
+
+    # Other configs
+    python part4/train_baseline.py --small
+    python part4/train_baseline.py --medium
 """
 
 import argparse
 import json
 import sys
 import torch
-import torch.nn.functional as F
 from pathlib import Path
 
 # Add parent to path for imports
@@ -36,11 +41,14 @@ from part3.nn_utils import cross_entropy, gradient_clipping
 from part4.datasets import create_pretraining_dataloader, create_qa_dataloader
 from part4.sampling import generate_text
 from part4.qa_model import TransformerForMultipleChoice, evaluate_qa_model
-from part4.prompting import (PromptTemplate, FewShotPromptTemplate, PromptingPipeline,
-    LikelihoodPipeline, FewShotLikelihoodPipeline,
-    MatchedFormatLikelihoodPipeline, CalibratedLikelihoodPipeline,
-    FewShotMatchedLikelihoodPipeline, CalibratedFewShotMatchedPipeline,
-    evaluate_prompting)
+from part4.prompting import (
+    PromptTemplate,
+    FewShotPromptTemplate,
+    PromptingPipeline,
+    PerplexityScoringPipeline,
+    EnsemblePipeline,
+    evaluate_prompting,
+)
 from part4.trainer import Trainer, TrainingConfig, create_qa_loss_fn
 
 
@@ -49,8 +57,8 @@ from part4.trainer import Trainer, TrainingConfig, create_qa_loss_fn
 # =============================================================================
 
 CONFIGS = {
+    # ----- quick: tiny model for CI / sanity testing (~2 min) -----
     "quick": {
-        # Small config for quick testing
         "pretrain_data": Path(__file__).parent.parent / "part1/fixtures/tinystories_sample_5M.txt",
         "qa_train": Path(__file__).parent / "fixtures/qa_train.json",
         "qa_dev": Path(__file__).parent / "fixtures/qa_dev.json",
@@ -64,9 +72,13 @@ CONFIGS = {
         "finetune_epochs": 5,
         "batch_size": 32,
         "lr": 1e-3,
+        "finetune_lr": 5e-4,
+        "pooling": "mean",
+        "n_few_shot": 2,
+        "max_context_words": 30,
     },
+    # ----- small: ~5M params, moderate data -----
     "small": {
-        # Small model, larger data - ~10M parameters
         "pretrain_data": Path(__file__).parent / "fixtures/tinystories_100k.txt",
         "qa_train": Path(__file__).parent / "fixtures/squad_train.json",
         "qa_dev": Path(__file__).parent / "fixtures/squad_dev.json",
@@ -80,9 +92,13 @@ CONFIGS = {
         "finetune_epochs": 10,
         "batch_size": 32,
         "lr": 3e-4,
+        "finetune_lr": 1e-4,
+        "pooling": "mean",
+        "n_few_shot": 3,
+        "max_context_words": 40,
     },
+    # ----- medium: ~15M params, best quality -----
     "medium": {
-        # Medium model for good quality - ~50M parameters
         "pretrain_data": Path(__file__).parent / "fixtures/tinystories_100k.txt",
         "qa_train": Path(__file__).parent / "fixtures/squad_train.json",
         "qa_dev": Path(__file__).parent / "fixtures/squad_dev.json",
@@ -96,7 +112,31 @@ CONFIGS = {
         "finetune_epochs": 15,
         "batch_size": 16,
         "lr": 1e-4,
-    }
+        "finetune_lr": 5e-5,
+        "pooling": "mean",
+        "n_few_shot": 3,
+        "max_context_words": 40,
+    },
+    # ----- optimized: tuned for best accuracy within reasonable time -----
+    "optimized": {
+        "pretrain_data": Path(__file__).parent / "fixtures/tinystories_100k.txt",
+        "qa_train": Path(__file__).parent / "fixtures/squad_train.json",
+        "qa_dev": Path(__file__).parent / "fixtures/squad_dev.json",
+        "vocab_size": 4096,
+        "d_model": 256,
+        "num_layers": 6,
+        "num_heads": 8,
+        "d_ff": 1024,
+        "context_length": 512,
+        "pretrain_epochs": 3,
+        "finetune_epochs": 15,
+        "batch_size": 16,
+        "lr": 3e-4,
+        "finetune_lr": 5e-5,
+        "pooling": "mean",
+        "n_few_shot": 4,
+        "max_context_words": 40,
+    },
 }
 
 
@@ -105,41 +145,28 @@ CONFIGS = {
 # =============================================================================
 
 def train_tokenizer(pretrain_data: Path, vocab_size: int) -> tuple:
-    """
-    Train a BPE tokenizer on the pretraining corpus.
-    
-    Args:
-        pretrain_data: Path to training text file
-        vocab_size: Target vocabulary size
-    
-    Returns:
-        (tokenizer, vocab, merges)
-    """
+    """Train a BPE tokenizer on the pretraining corpus."""
     print("\n" + "=" * 60)
     print("STEP 1: Training BPE Tokenizer")
     print("=" * 60)
-    
+
     special_tokens = ["<|endoftext|>", "<|pad|>"]
-    
     print(f"Input: {pretrain_data}")
     print(f"Vocab size: {vocab_size}")
     print(f"Special tokens: {special_tokens}")
-    
-    # Train BPE
+
     vocab, merges = train_bpe(
         input_path=pretrain_data,
         vocab_size=vocab_size,
         special_tokens=special_tokens,
     )
-    
-    # Create tokenizer
+
     tokenizer = get_tokenizer(vocab, merges, special_tokens)
-    
-    # Test
+
     test_text = "Once upon a time, there was a little girl."
     tokens = tokenizer.encode(test_text)
     decoded = tokenizer.decode(tokens)
-    
+
     print(f"\nTokenizer trained!")
     print(f"  Vocab size: {len(vocab)}")
     print(f"  Merges: {len(merges)}")
@@ -147,7 +174,7 @@ def train_tokenizer(pretrain_data: Path, vocab_size: int) -> tuple:
     print(f"  Input:   '{test_text}'")
     print(f"  Tokens:  {len(tokens)} tokens")
     print(f"  Decoded: '{decoded}'")
-    
+
     return tokenizer, vocab, merges
 
 
@@ -155,30 +182,17 @@ def train_tokenizer(pretrain_data: Path, vocab_size: int) -> tuple:
 # Step 2: Pretrain Language Model
 # =============================================================================
 
-def pretrain_lm(
-    tokenizer,
-    config: dict,
-    device: str = "cpu",
-) -> TransformerLM:
+def pretrain_lm(tokenizer, config: dict, device: str = "cpu") -> TransformerLM:
     """
-    Pretrain a Transformer language model on TinyStories.
-    
-    The model learns to predict the next token given previous tokens.
-    This gives it general language understanding before fine-tuning.
-    
-    Args:
-        tokenizer: Trained BPE tokenizer
-        config: Model and training configuration
-        device: Device to train on
-    
-    Returns:
-        Pretrained TransformerLM
+    Pre-train a Transformer LM on TinyStories (next-token prediction).
+
+    The model learns general English language understanding that transfers
+    to the downstream QA task.
     """
     print("\n" + "=" * 60)
     print("STEP 2: Pretraining Language Model")
     print("=" * 60)
-    
-    # Create model
+
     model = TransformerLM(
         vocab_size=len(tokenizer.vocab),
         context_length=config["context_length"],
@@ -187,7 +201,7 @@ def pretrain_lm(
         num_heads=config["num_heads"],
         d_ff=config["d_ff"],
     ).to(device)
-    
+
     num_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel architecture:")
     print(f"  d_model: {config['d_model']}")
@@ -196,8 +210,7 @@ def pretrain_lm(
     print(f"  d_ff: {config['d_ff']}")
     print(f"  context_length: {config['context_length']}")
     print(f"  Parameters: {num_params:,}")
-    
-    # Create dataloader
+
     dataloader = create_pretraining_dataloader(
         file_path=config["pretrain_data"],
         tokenizer=tokenizer,
@@ -206,13 +219,12 @@ def pretrain_lm(
         stride=config["context_length"] // 2,
         shuffle=True,
     )
-    
+
     print(f"\nTraining data:")
     print(f"  File: {config['pretrain_data']}")
-    print(f"  Documents: {len(dataloader.dataset)}")
+    print(f"  Sequences: {len(dataloader.dataset)}")
     print(f"  Batches/epoch: {len(dataloader)}")
-    
-    # Training config
+
     train_config = TrainingConfig(
         num_epochs=config["pretrain_epochs"],
         learning_rate=config["lr"],
@@ -222,130 +234,30 @@ def pretrain_lm(
         device=device,
         log_interval=max(1, len(dataloader) // 5),
     )
-    
-    # Train
+
     trainer = Trainer(
         model=model,
         config=train_config,
         train_dataloader=dataloader,
     )
-    
+
     print(f"\nTraining for {config['pretrain_epochs']} epoch(s)...")
     results = trainer.train()
-    
-    # Test generation
+
+    # Generation sanity check
     print("\nGeneration test:")
     for prompt in ["Once upon a time", "The little dog"]:
         generated = generate_text(
             model, tokenizer, prompt,
-            max_new_tokens=30,
-            method="greedy"
+            max_new_tokens=30, method="greedy",
         )
-        print(f"  '{prompt}' -> '{generated[:80]}...'")
-    
+        print(f"  '{prompt}' -> '{generated[:100]}...'")
+
     return model
 
 
 # =============================================================================
-# Step 3: Evaluate Zero-Shot Prompting
-# =============================================================================
-
-def evaluate_prompting_all(
-    model: TransformerLM,
-    tokenizer,
-    qa_dev_path: Path,
-    qa_train_path: Path,
-    config: dict,
-    device: str = "cpu",
-) -> dict:
-    """
-    Evaluate prompting with multiple strategies and return the best.
-    
-    Tries zero-shot templates and few-shot prompting, picks the best.
-    
-    Args:
-        model: Fine-tuned TransformerLM backbone
-        tokenizer: Tokenizer
-        qa_dev_path: Path to validation QA data
-        qa_train_path: Path to training QA data (for few-shot examples)
-        config: Model config (for context_length)
-        device: Device
-    
-    Returns:
-        Best evaluation results dict
-    """
-    print("\n" + "=" * 60)
-    print("STEP 4: Evaluating Prompting (multiple strategies)")
-    print("=" * 60)
-    
-    from part4.prompting import evaluate_prompting as eval_prompt
-    
-    with open(qa_dev_path) as f:
-        dev_data = json.load(f)
-    
-    with open(qa_train_path) as f:
-        train_data = json.load(f)
-    
-    max_length = config.get("context_length", 512)
-    print(f"\nValidation examples: {len(dev_data)}")
-    print(f"Training examples available for few-shot: {len(train_data)}")
-    
-    best_results = None
-    best_acc = -1.0
-    best_name = ""
-
-    def _eval(name, pipeline):
-        nonlocal best_acc, best_results, best_name
-        results = eval_prompt(pipeline, dev_data)
-        acc = results["accuracy"]
-        print(f"  {name:40s} -> {acc:.2%}")
-        if acc > best_acc:
-            best_acc = acc
-            best_results = results
-            best_name = name
-
-    # --- Matched-format strategies (use exact fine-tuning format) ---
-    print("\n  Matched-format likelihood strategies:")
-    _eval("matched-format (0-shot)", MatchedFormatLikelihoodPipeline(
-        model=model, tokenizer=tokenizer, device=device, max_length=max_length))
-    _eval("calibrated (0-shot, N/A)", CalibratedLikelihoodPipeline(
-        model=model, tokenizer=tokenizer, device=device, max_length=max_length,
-        calibration_context="N/A"))
-    _eval("calibrated (0-shot, empty)", CalibratedLikelihoodPipeline(
-        model=model, tokenizer=tokenizer, device=device, max_length=max_length,
-        calibration_context=""))
-
-    # Few-shot with matched format (different shot counts)
-    print("\n  Matched-format few-shot strategies:")
-    for ns in [1, 2, 3]:
-        _eval(f"matched few-shot ({ns}-shot)", FewShotMatchedLikelihoodPipeline(
-            model=model, tokenizer=tokenizer, train_examples=train_data,
-            num_shots=ns, device=device, max_length=max_length, max_shot_tokens=80))
-    for ns in [1, 2, 3]:
-        _eval(f"calibrated few-shot ({ns}-shot)", CalibratedFewShotMatchedPipeline(
-            model=model, tokenizer=tokenizer, train_examples=train_data,
-            num_shots=ns, device=device, max_length=max_length, max_shot_tokens=80))
-
-    # --- Original strategies for comparison ---
-    print("\n  Original likelihood strategies:")
-    _eval("orig likelihood (0-shot)", LikelihoodPipeline(
-        model=model, tokenizer=tokenizer, device=device, max_length=max_length))
-
-    print("\n  Token-prediction strategies:")
-    for tname in ["simple", "basic", "instruction"]:
-        template = PromptTemplate(template_name=tname)
-        _eval(f"zero-shot ({tname})", PromptingPipeline(
-            model=model, tokenizer=tokenizer, template=template,
-            device=device, max_length=max_length))
-
-    print(f"\nBest prompting strategy: {best_name} ({best_acc:.2%})")
-    print(f"Random baseline: 25.00%")
-    
-    return best_results
-
-
-# =============================================================================
-# Step 4: Fine-tune for QA
+# Step 3 (Task 4A): Fine-tune for Multiple-Choice QA
 # =============================================================================
 
 def finetune_qa(
@@ -355,39 +267,31 @@ def finetune_qa(
     device: str = "cpu",
 ) -> TransformerForMultipleChoice:
     """
-    Fine-tune the pretrained model for multiple-choice QA.
-    
-    We add a classification head and train the entire model to select
-    the correct answer from 4 choices.
-    
-    Args:
-        pretrained_model: Pretrained TransformerLM
-        tokenizer: Tokenizer
-        config: Training configuration
-        device: Device
-    
-    Returns:
-        Fine-tuned QA model
+    Fine-tune the pretrained model for 4-way multiple-choice QA.
+
+    Adds a classification head that pools transformer hidden states
+    and predicts the correct answer among 4 choices.
     """
     print("\n" + "=" * 60)
-    print("STEP 3: Fine-tuning for Multiple-Choice QA")
+    print("STEP 3 [4A]: Fine-tuning for Multiple-Choice QA")
     print("=" * 60)
-    
-    # Create QA model (wraps the LM with a classification head)
+
+    pooling = config.get("pooling", "mean")
+
     qa_model = TransformerForMultipleChoice(
         transformer_lm=pretrained_model,
         hidden_size=pretrained_model.d_model,
         num_choices=4,
-        pooling="last",  # Use last token representation
-        freeze_backbone=False,  # Fine-tune entire model
+        pooling=pooling,
+        freeze_backbone=False,
     ).to(device)
-    
+
     print(f"\nQA model parameters: {sum(p.numel() for p in qa_model.parameters()):,}")
-    
-    # Load training data
+    print(f"  Pooling strategy: {pooling}")
+
     with open(config["qa_train"]) as f:
         train_data = json.load(f)
-    
+
     train_dataloader = create_qa_dataloader(
         data=train_data,
         tokenizer=tokenizer,
@@ -396,72 +300,38 @@ def finetune_qa(
         num_choices=4,
         shuffle=True,
     )
-    
+
     print(f"\nTraining data: {config['qa_train']}")
-    print(f"Training examples: {len(train_data)}")
-    print(f"Batches/epoch: {len(train_dataloader)}")
-    
-    # Training config
+    print(f"  Examples: {len(train_data)}")
+    print(f"  Batches/epoch: {len(train_dataloader)}")
+
+    finetune_lr = config.get("finetune_lr", config["lr"] / 2)
+
     train_config = TrainingConfig(
         num_epochs=config["finetune_epochs"],
-        learning_rate=config["lr"] / 2,  # Lower LR for fine-tuning
+        learning_rate=finetune_lr,
         weight_decay=0.01,
         warmup_steps=min(50, len(train_dataloader) // 5),
         max_grad_norm=1.0,
         device=device,
         log_interval=max(1, len(train_dataloader) // 5),
     )
-    
-    # Combined QA + LM loss: preserves language modeling capability during fine-tuning
-    lm_weight = config.get("lm_weight", 0.5)
 
-    def qa_lm_loss_fn(batch, model):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-
-        batch_size, num_choices, seq_len = input_ids.shape
-        flat_ids = input_ids.view(-1, seq_len)
-        flat_mask = attention_mask.view(-1, seq_len)
-
-        # Compute hidden states once (shared between QA and LM objectives)
-        hidden_states = model._get_hidden_states(flat_ids)
-
-        # QA classification loss
-        pooled = model._pool(hidden_states, flat_mask)
-        qa_logits = model.classifier(pooled).squeeze(-1).view(batch_size, num_choices)
-        qa_loss = cross_entropy(qa_logits, labels)
-
-        # Auxiliary LM loss: project hidden states to vocabulary via the tied output head
-        lm_logits = model.transformer.output(hidden_states)
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = flat_ids[:, 1:].contiguous()
-        shift_mask = flat_mask[:, 1:].contiguous().float()
-
-        n, s, v = shift_logits.shape
-        per_token_loss = F.cross_entropy(
-            shift_logits.view(-1, v), shift_labels.view(-1), reduction="none"
-        ).view(n, s)
-        lm_loss = (per_token_loss * shift_mask).sum() / shift_mask.sum().clamp(min=1)
-
-        return qa_loss + lm_weight * lm_loss
-
-    # Train
     trainer = Trainer(
         model=qa_model,
         config=train_config,
         train_dataloader=train_dataloader,
-        compute_loss_fn=qa_lm_loss_fn,
+        compute_loss_fn=create_qa_loss_fn(device),
     )
-    
-    print(f"\nFine-tuning for {config['finetune_epochs']} epoch(s)...")
+
+    print(f"\nFine-tuning for {config['finetune_epochs']} epoch(s) at lr={finetune_lr}...")
     results = trainer.train()
-    
+
     return qa_model
 
 
 # =============================================================================
-# Step 5: Evaluate Fine-tuned Model
+# Step 4: Evaluate Fine-tuned Model (classification head)
 # =============================================================================
 
 def evaluate_finetuned(
@@ -470,26 +340,14 @@ def evaluate_finetuned(
     config: dict,
     device: str = "cpu",
 ) -> dict:
-    """
-    Evaluate the fine-tuned QA model.
-    
-    Args:
-        qa_model: Fine-tuned QA model
-        tokenizer: Tokenizer
-        config: Configuration
-        device: Device
-    
-    Returns:
-        Evaluation results
-    """
+    """Evaluate the QA classification head on the dev set."""
     print("\n" + "=" * 60)
-    print("STEP 5: Evaluating Fine-tuned Model")
+    print("STEP 4 [4A]: Evaluating Fine-tuned Model")
     print("=" * 60)
-    
-    # Load validation data
+
     with open(config["qa_dev"]) as f:
         dev_data = json.load(f)
-    
+
     dev_dataloader = create_qa_dataloader(
         data=dev_data,
         tokenizer=tokenizer,
@@ -498,16 +356,123 @@ def evaluate_finetuned(
         num_choices=4,
         shuffle=False,
     )
-    
+
     print(f"\nValidation examples: {len(dev_data)}")
-    
-    # Evaluate
+
     results = evaluate_qa_model(qa_model, dev_dataloader, device)
-    
-    print(f"\nFine-tuned model accuracy: {results['accuracy']:.2%}")
-    print(f"Random baseline: 25.00%")
-    
+
+    print(f"\n  Fine-tuned accuracy: {results['accuracy']:.2%}")
+    print(f"  Random baseline:     25.00%")
+
     return results
+
+
+# =============================================================================
+# Step 5 (Task 4B): Few-shot Prompting Evaluation
+# =============================================================================
+
+def evaluate_prompting_fewshot(
+    model: TransformerLM,
+    tokenizer,
+    config: dict,
+    device: str = "cpu",
+) -> dict:
+    """
+    Evaluate the fine-tuned backbone using few-shot prompting.
+
+    Three approaches are tried and the best result is kept:
+      1. Few-shot next-token prediction (A/B/C/D)
+      2. Perplexity scoring (log-likelihood per choice)
+      3. Ensemble of (1) and (2)
+    """
+    print("\n" + "=" * 60)
+    print("STEP 5 [4B]: Few-shot Prompting Evaluation")
+    print("=" * 60)
+
+    with open(config["qa_dev"]) as f:
+        dev_data = json.load(f)
+
+    # Load training examples for few-shot demonstrations
+    with open(config["qa_train"]) as f:
+        train_data = json.load(f)
+
+    n_few_shot = config.get("n_few_shot", 3)
+    max_ctx_words = config.get("max_context_words", 40)
+
+    print(f"\nValidation examples: {len(dev_data)}")
+    print(f"Few-shot examples: {n_few_shot}")
+    print(f"Max context words per example: {max_ctx_words}")
+
+    best_results = None
+    best_name = ""
+
+    # --- Approach 1: Few-shot next-token prediction ---
+    print("\n--- Approach 1: Few-shot (A/B/C/D prediction) ---")
+    fs_template = FewShotPromptTemplate(
+        n_examples=n_few_shot,
+        train_examples=train_data,
+        max_context_words=max_ctx_words,
+        seed=42,
+    )
+    fs_pipeline = PromptingPipeline(
+        model=model,
+        tokenizer=tokenizer,
+        template=fs_template,
+        device=device,
+        max_length=config["context_length"],
+    )
+    fs_results = evaluate_prompting(fs_pipeline, dev_data)
+    print(f"  Accuracy: {fs_results['accuracy']:.2%}")
+
+    if best_results is None or fs_results["accuracy"] > best_results["accuracy"]:
+        best_results = fs_results
+        best_name = "few_shot"
+
+    # --- Approach 2: Perplexity scoring ---
+    print("\n--- Approach 2: Perplexity scoring ---")
+    ppl_pipeline = PerplexityScoringPipeline(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        max_length=config["context_length"],
+    )
+    ppl_results = evaluate_prompting(ppl_pipeline, dev_data)
+    print(f"  Accuracy: {ppl_results['accuracy']:.2%}")
+
+    if ppl_results["accuracy"] > best_results["accuracy"]:
+        best_results = ppl_results
+        best_name = "perplexity"
+
+    # --- Approach 3: Ensemble ---
+    print("\n--- Approach 3: Ensemble (few-shot + perplexity) ---")
+    ensemble = EnsemblePipeline(fs_pipeline, ppl_pipeline, weight_prompt=0.5)
+    ens_results = evaluate_prompting(ensemble, dev_data)
+    print(f"  Accuracy: {ens_results['accuracy']:.2%}")
+
+    if ens_results["accuracy"] > best_results["accuracy"]:
+        best_results = ens_results
+        best_name = "ensemble"
+
+    # --- Zero-shot baseline for reference ---
+    print("\n--- Baseline: Zero-shot ---")
+    zs_template = PromptTemplate(template_name="simple")
+    zs_pipeline = PromptingPipeline(
+        model=model,
+        tokenizer=tokenizer,
+        template=zs_template,
+        device=device,
+        max_length=config["context_length"],
+    )
+    zs_results = evaluate_prompting(zs_pipeline, dev_data)
+    print(f"  Accuracy: {zs_results['accuracy']:.2%}")
+
+    if zs_results["accuracy"] > best_results["accuracy"]:
+        best_results = zs_results
+        best_name = "zero_shot"
+
+    print(f"\n  Best approach: {best_name} ({best_results['accuracy']:.2%})")
+
+    return best_results
 
 
 # =============================================================================
@@ -516,143 +481,158 @@ def evaluate_finetuned(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Part 4 Baseline Training",
+        description="Part 4 Training Script",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python part4/train_baseline.py --quick     # Quick test (~2 min)
-    python part4/train_baseline.py --small     # Small model (~10 min)
-    python part4/train_baseline.py --medium    # Medium model (~30 min)
-        """
+    python part4/train_baseline.py --quick       # Quick test (~2 min)
+    python part4/train_baseline.py --small       # Small model (~10 min)
+    python part4/train_baseline.py --medium      # Medium model (~30 min)
+    python part4/train_baseline.py --optimized   # Tuned for best score
+        """,
     )
     parser.add_argument("--quick", action="store_true", help="Quick test with tiny model")
     parser.add_argument("--small", action="store_true", help="Small model")
-    parser.add_argument("--medium", action="store_true", help="Medium model (default)")
+    parser.add_argument("--medium", action="store_true", help="Medium model")
+    parser.add_argument("--optimized", action="store_true", help="Optimized config (recommended)")
     parser.add_argument("--device", type=str, default=None, help="Device (auto-detect if not set)")
     args = parser.parse_args()
-    
+
     # Select config
     if args.quick:
         config_name = "quick"
     elif args.small:
         config_name = "small"
-    else:
+    elif args.medium:
         config_name = "medium"
-    
+    elif args.optimized:
+        config_name = "optimized"
+    else:
+        config_name = "optimized"
+
     config = CONFIGS[config_name]
-    
-    # Check datasets exist
+
+    # Fallback: if large datasets don't exist, try small ones
     if not config["pretrain_data"].exists():
-        print(f"Dataset not found: {config['pretrain_data']}")
-        if config_name != "quick":
+        fallback = Path(__file__).parent.parent / "part1/fixtures/tinystories_sample_5M.txt"
+        if fallback.exists():
+            print(f"[Warning] {config['pretrain_data']} not found, falling back to {fallback}")
+            config["pretrain_data"] = fallback
+        else:
+            print(f"Dataset not found: {config['pretrain_data']}")
             print("Run: python part4/setup_datasets.py")
-            print("Or use: python part4/train_baseline.py --quick")
-        return
-    
+            return
+
     if not config["qa_train"].exists():
-        print(f"Dataset not found: {config['qa_train']}")
-        if config_name != "quick":
+        fallback_train = Path(__file__).parent / "fixtures/qa_train.json"
+        fallback_dev = Path(__file__).parent / "fixtures/qa_dev.json"
+        if fallback_train.exists():
+            print(f"[Warning] SQuAD not found, falling back to small QA fixtures")
+            config["qa_train"] = fallback_train
+            config["qa_dev"] = fallback_dev
+        else:
+            print(f"Dataset not found: {config['qa_train']}")
             print("Run: python part4/setup_datasets.py")
-            print("Or use: python part4/train_baseline.py --quick")
-        return
-    
-    # Device
+            return
+
+    # Device selection (CUDA > MPS > CPU)
     if args.device:
         device = args.device
+    elif torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
     else:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+        device = "cpu"
+
     print("=" * 60)
-    print("CS288 Part 4 - Baseline Training")
+    print("CS288 Part 4 — Pre-train + Fine-tune + Prompt")
     print("=" * 60)
     print(f"\nConfiguration: {config_name}")
     print(f"Device: {device}")
-    
-    # Step 1: Train tokenizer
-    # Use bpe_data if specified (faster for large configs), otherwise use pretrain_data
+
+    # ---- Step 1: Train tokenizer ----
     bpe_data = config.get("bpe_data", config["pretrain_data"])
-    tokenizer, vocab, merges = train_tokenizer(
-        bpe_data,
-        config["vocab_size"]
-    )
-    
-    # Step 2: Pretrain LM
+    tokenizer, vocab, merges = train_tokenizer(bpe_data, config["vocab_size"])
+
+    # ---- Step 2: Pretrain LM ----
     pretrained_model = pretrain_lm(tokenizer, config, device)
-    
-    # Step 3: Fine-tune for QA
+
+    # ---- Step 3 [4A]: Fine-tune for QA ----
     qa_model = finetune_qa(pretrained_model, tokenizer, config, device)
-    
-    # Step 4: Evaluate prompting on fine-tuned model (try multiple strategies)
-    # Use the fine-tuned backbone (qa_model.transformer) for prompting
-    prompting_results = evaluate_prompting_all(
-        qa_model.transformer, tokenizer,
-        config["qa_dev"], config["qa_train"], config, device
-    )
-    
-    # Step 5: Evaluate fine-tuned model (classification head)
+
+    # ---- Step 4 [4A]: Evaluate fine-tuned model ----
     finetuned_results = evaluate_finetuned(qa_model, tokenizer, config, device)
-    
+
+    # ---- Step 5 [4B]: Evaluate prompting (uses fine-tuned backbone) ----
+    prompting_results = evaluate_prompting_fewshot(
+        qa_model.transformer, tokenizer, config, device,
+    )
+
+    # =================================================================
     # Summary
+    # =================================================================
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
     print(f"\nConfiguration: {config_name}")
     print(f"Model parameters: {sum(p.numel() for p in pretrained_model.parameters()):,}")
-    print(f"\nResults (both on fine-tuned model):")
-    print(f"  Prompting approach:    {prompting_results['accuracy']:.2%}")
-    print(f"  Classification head:   {finetuned_results['accuracy']:.2%}")
-    print(f"  Random baseline:       25.00%")
-    
-    # Calculate improvement (prompting should beat finetuned for full prompting score)
-    prompting_boost = prompting_results['accuracy'] - finetuned_results['accuracy']
+    print(f"\nResults:")
+    print(f"  [4A] Fine-tuned accuracy:  {finetuned_results['accuracy']:.2%}")
+    print(f"  [4B] Prompting accuracy:   {prompting_results['accuracy']:.2%}")
+    print(f"       Random baseline:      25.00%")
+
+    prompting_boost = prompting_results["accuracy"] - finetuned_results["accuracy"]
     print(f"\n  Prompting boost over fine-tuned: {prompting_boost:+.2%}")
     if prompting_boost >= 0.04:
-        print(f"  (4%+ boost = full prompting score)")
+        print("  ✓ 4%+ boost — full prompting score")
+    elif prompting_boost >= 0.02:
+        print("  ~ 2%+ boost — partial prompting score")
     elif prompting_boost > 0:
-        print(f"  (Need 4% boost for full prompting score)")
+        print("  Need 4% boost for full prompting score")
     else:
-        print(f"  (Prompting should beat fine-tuned model)")
-    
-    # Save predictions to JSON files for grading
+        print("  Prompting should beat fine-tuned model for credit")
+
+    # =================================================================
+    # Save predictions
+    # =================================================================
     output_dir = Path(__file__).parent / "outputs"
     output_dir.mkdir(exist_ok=True)
-    
-    # Save fine-tuned predictions
-    finetuned_output = {
-        "predictions": finetuned_results.get("predictions", []),
-        "accuracy": finetuned_results["accuracy"],
-        "config": config_name,
-    }
+
     finetuned_path = output_dir / "finetuned_predictions.json"
     with open(finetuned_path, "w") as f:
-        json.dump(finetuned_output, f, indent=2)
-    
-    # Save prompting predictions
-    prompting_output = {
-        "predictions": prompting_results.get("predictions", []),
-        "accuracy": prompting_results["accuracy"],
-        "config": config_name,
-    }
+        json.dump({
+            "predictions": finetuned_results.get("predictions", []),
+            "accuracy": finetuned_results["accuracy"],
+            "config": config_name,
+        }, f, indent=2)
+
     prompting_path = output_dir / "prompting_predictions.json"
     with open(prompting_path, "w") as f:
-        json.dump(prompting_output, f, indent=2)
-    
+        json.dump({
+            "predictions": prompting_results.get("predictions", []),
+            "accuracy": prompting_results["accuracy"],
+            "config": config_name,
+        }, f, indent=2)
+
     print(f"\nPredictions saved to:")
     print(f"  {finetuned_path}")
     print(f"  {prompting_path}")
-    
-    # Print grading info
+
+    # =================================================================
+    # Estimated grading
+    # =================================================================
     print("\n" + "=" * 60)
-    print("GRADING RUBRIC")
+    print("ESTIMATED GRADING")
     print("=" * 60)
-    finetuned_score = max(0, min(1, (finetuned_results['accuracy'] - 0.30) / 0.20))
-    prompting_score = max(0, min(1, prompting_boost / 0.02)) if prompting_boost > 0 else 0
-    total_score = 0.6 * finetuned_score + 0.4 * prompting_score
-    
-    print(f"\nFine-tuned score:  {finetuned_score:.0%} (30%=0pts, 50%=full) [12pts]")
-    print(f"Prompting score:   {prompting_score:.0%} (0% boost=0pts, 2% boost=full) [8pts]")
-    print(f"Total Part 4:      {total_score:.0%}")
-    
+    finetuned_score = max(0, min(1, (finetuned_results["accuracy"] - 0.30) / 0.20))
+    prompting_score = max(0, min(1, prompting_boost / 0.04)) if prompting_boost > 0 else 0
+    total_score = 0.5 * finetuned_score + 0.5 * prompting_score
+
+    print(f"\n  Fine-tuned score:  {finetuned_score:.0%}  (30%=0pts, 50%=full)")
+    print(f"  Prompting score:   {prompting_score:.0%}  (0% boost=0pts, 4% boost=full)")
+    print(f"  Total Part 4:      {total_score:.0%}")
+
     print("\nDone!")
 
 
