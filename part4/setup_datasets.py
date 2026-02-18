@@ -99,6 +99,7 @@ def download_squad():
         - Distractors: answers from other questions in the same context
         """
         import random
+        random.seed(42)
         
         # Group by context to find distractors
         context_answers = {}
