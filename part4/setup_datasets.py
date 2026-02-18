@@ -80,122 +80,33 @@ def download_tinystories():
 def download_squad():
     """Download SQuAD v1.1 dataset for QA fine-tuning."""
     print("\n" + "=" * 60)
-    print("Downloading SQuAD v1.1 dataset...")
+    print("Checking SQuAD datasets...")
     print("=" * 60)
     
-    # Load SQuAD from HuggingFace
-    dataset = load_dataset("squad", split="train")
-    val_dataset = load_dataset("squad", split="validation")
-    
-    print(f"Training examples: {len(dataset):,}")
-    print(f"Validation examples: {len(val_dataset):,}")
-    
-    def convert_to_multiple_choice(examples, num_examples=None, num_distractors=3):
-        """
-        Convert extractive QA to multiple choice format.
-        
-        For each question:
-        - Correct answer: the actual answer from the dataset
-        - Distractors: answers from other questions in the same context
-        """
-        import random
-        random.seed(42)
-        
-        # Group by context to find distractors
-        context_answers = {}
-        for ex in examples:
-            ctx_id = ex["context"][:100]  # Use first 100 chars as key
-            if ctx_id not in context_answers:
-                context_answers[ctx_id] = []
-            context_answers[ctx_id].append(ex["answers"]["text"][0])
-        
-        # Get all unique answers for random distractors
-        all_answers = list(set(
-            ex["answers"]["text"][0] for ex in examples 
-            if ex["answers"]["text"]
-        ))
-        
-        converted = []
-        for i, ex in enumerate(examples):
-            if num_examples and i >= num_examples:
-                break
-            
-            if not ex["answers"]["text"]:
-                continue
-            
-            correct_answer = ex["answers"]["text"][0]
-            
-            # Get distractors (other answers, preferring same context)
-            ctx_id = ex["context"][:100]
-            same_ctx_answers = [a for a in context_answers.get(ctx_id, []) if a != correct_answer]
-            other_answers = [a for a in all_answers if a != correct_answer and a not in same_ctx_answers]
-            
-            # Select distractors
-            distractors = []
-            if same_ctx_answers:
-                distractors.extend(random.sample(same_ctx_answers, min(1, len(same_ctx_answers))))
-            
-            remaining = num_distractors - len(distractors)
-            if remaining > 0 and other_answers:
-                distractors.extend(random.sample(other_answers, min(remaining, len(other_answers))))
-            
-            # Pad with generic distractors if needed
-            generic = ["Unknown", "Not mentioned", "Cannot determine"]
-            while len(distractors) < num_distractors:
-                distractors.append(random.choice(generic))
-            
-            # Create choices and shuffle
-            choices = [correct_answer] + distractors[:num_distractors]
-            answer_idx = 0  # Correct answer is first
-            
-            # Shuffle
-            indices = list(range(len(choices)))
-            random.shuffle(indices)
-            choices = [choices[i] for i in indices]
-            answer_idx = indices.index(0)
-            
-            converted.append({
-                "context": ex["context"],
-                "question": ex["question"],
-                "choices": choices,
-                "answer": answer_idx,
-                "id": ex["id"],
-            })
-        
-        return converted
-    
-    # Convert datasets
-    print("\nConverting to multiple-choice format...")
-    
-    # Training set: use 10k examples (manageable for assignment)
-    train_mc = convert_to_multiple_choice(dataset, num_examples=10000)
-    
-    # Validation: use 2k examples  
-    val_mc = convert_to_multiple_choice(val_dataset, num_examples=2000)
-    
-    # Test: use 1k examples (subset of validation for hidden test)
-    test_mc = convert_to_multiple_choice(val_dataset, num_examples=1000)
-    
-    # Save
     train_path = FIXTURES_DIR / "squad_train.json"
     val_path = FIXTURES_DIR / "squad_dev.json"
     test_path = FIXTURES_DIR / "squad_test.json"
     
-    with open(train_path, "w") as f:
-        json.dump(train_mc, f, indent=2)
+    # Use the committed JSON files as the canonical data source.
+    # NEVER regenerate them — predictions must match these exact files.
+    if train_path.exists() and val_path.exists() and test_path.exists():
+        with open(train_path) as f:
+            n_train = len(json.load(f))
+        with open(val_path) as f:
+            n_val = len(json.load(f))
+        with open(test_path) as f:
+            n_test = len(json.load(f))
+        print(f"\nSQuAD datasets already exist — using committed versions:")
+        print(f"  Training:   {train_path} ({n_train:,} examples)")
+        print(f"  Validation: {val_path} ({n_val:,} examples)")
+        print(f"  Test:       {test_path} ({n_test:,} examples)")
+        return train_path, val_path, test_path
     
-    with open(val_path, "w") as f:
-        json.dump(val_mc, f, indent=2)
-    
-    with open(test_path, "w") as f:
-        json.dump(test_mc, f, indent=2)
-    
-    print(f"\nSaved:")
-    print(f"  Training:   {train_path} ({len(train_mc):,} examples)")
-    print(f"  Validation: {val_path} ({len(val_mc):,} examples)")
-    print(f"  Test:       {test_path} ({len(test_mc):,} examples)")
-    
-    return train_path, val_path, test_path
+    # Only reach here if files are missing (shouldn't happen after git clone)
+    raise FileNotFoundError(
+        "SQuAD fixture files not found! These should be committed in the repo.\n"
+        f"Expected: {train_path}, {val_path}, {test_path}"
+    )
 
 
 def main():
