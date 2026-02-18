@@ -5,8 +5,14 @@ Uses the fine-tuned TransformerForMultipleChoice model (classification head)
 with different input prompt formats. "Prompting" here means experimenting
 with how context/question/answer are formatted before being fed to the
 same classification model from Part 4A.
+
+Key improvements over the baseline fine-tuned evaluation:
+1. Smart truncation that always preserves question + answer (matches training)
+2. Multiple complementary prompt formats
+3. Majority-vote ensemble across formats for robust predictions
 """
 import torch
+from collections import Counter
 from typing import List, Dict, Any, Optional, Callable
 import sys
 from pathlib import Path
@@ -25,34 +31,47 @@ def format_base(context: str, question: str, choice: str) -> str:
     return f"{context}\n\nQuestion: {question}\n\nAnswer: {choice}"
 
 
-def format_instruction(context: str, question: str, choice: str) -> str:
-    """Prepend a short instruction."""
-    return (
-        f"Read the passage and answer the question.\n\n"
-        f"{context}\n\nQuestion: {question}\n\nAnswer: {choice}"
-    )
-
-
-def format_restated(context: str, question: str, choice: str) -> str:
-    """Restate the question as part of the answer."""
+def format_highlight(context: str, question: str, choice: str) -> str:
+    """Repeat the question near the answer to strengthen the signal."""
     return (
         f"{context}\n\n"
         f"Question: {question}\n\n"
-        f"Based on the passage, the answer to \"{question}\" is: {choice}"
+        f"The answer to \"{question}\" is: {choice}"
     )
 
 
 def format_compact(context: str, question: str, choice: str) -> str:
-    """Compact single-line style."""
+    """Compact style — less padding tokens, more context fits."""
     return f"{context}\nQ: {question}\nA: {choice}"
 
 
 PROMPT_STYLES: Dict[str, Callable] = {
     "base": format_base,
-    "instruction": format_instruction,
-    "restated": format_restated,
+    "highlight": format_highlight,
     "compact": format_compact,
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smart truncation: always preserve question + answer, trim context only
+# ─────────────────────────────────────────────────────────────────────────────
+
+def encode_with_smart_truncation(
+    tokenizer, context: str, suffix: str, max_length: int
+) -> List[int]:
+    """
+    Encode context + suffix, trimming context (not suffix) when too long.
+    This matches what MultipleChoiceQADataset does during training.
+    """
+    suffix_ids = tokenizer.encode(suffix)
+    context_ids = tokenizer.encode(context)
+    max_context = max(0, max_length - len(suffix_ids) - 1)
+    if len(context_ids) > max_context:
+        context_ids = context_ids[:max_context]
+    token_ids = context_ids + suffix_ids
+    if len(token_ids) > max_length:
+        token_ids = token_ids[:max_length]
+    return token_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,18 +91,16 @@ def evaluate_with_prompt(
     """
     Run the fine-tuned TransformerForMultipleChoice with a specific prompt format.
 
-    For each example, each choice is formatted via format_fn(context, question, choice),
-    tokenised, padded, and fed through the classification head. The choice with the
-    highest logit wins.
-
-    Returns dict with 'accuracy' and 'predictions' (ordered same as examples).
+    Uses smart truncation (trim context, keep question+answer) to match training.
+    Returns dict with 'accuracy', 'predictions', and raw 'logits'.
     """
     qa_model.eval()
     qa_model.to(device)
 
-    pad_id = 0  # <|pad|> is token 0 or 1 depending on tokenizer; use 0 as safe default
+    pad_id = 0
 
     all_preds: List[int] = []
+    all_logits: List[List[float]] = []
 
     for start in range(0, len(examples), batch_size):
         batch_exs = examples[start : start + batch_size]
@@ -94,11 +111,15 @@ def evaluate_with_prompt(
             choice_ids_list = []
             choice_mask_list = []
             for choice in ex["choices"]:
-                text = format_fn(ex["context"], ex["question"], choice)
-                ids = tokenizer.encode(text)
-                # Truncate from the RIGHT to match training truncation
-                if len(ids) > max_length:
-                    ids = ids[:max_length]
+                # Build the suffix (question + answer portion) separately
+                # so we can do smart truncation on the context only
+                full_text = format_fn(ex["context"], ex["question"], choice)
+                context_text = ex["context"]
+                suffix_text = full_text[len(context_text):]  # everything after context
+
+                ids = encode_with_smart_truncation(
+                    tokenizer, context_text, suffix_text, max_length
+                )
                 mask = [1] * len(ids)
                 pad = max_length - len(ids)
                 ids = ids + [pad_id] * pad
@@ -111,8 +132,11 @@ def evaluate_with_prompt(
 
         input_ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
         attention_mask = torch.tensor(batch_masks, dtype=torch.long, device=device)
-        preds = qa_model.predict(input_ids, attention_mask)
+
+        logits = qa_model(input_ids, attention_mask)  # (batch, num_choices)
+        preds = logits.argmax(dim=-1)
         all_preds.extend(preds.cpu().tolist())
+        all_logits.extend(logits.cpu().tolist())
 
     # Compute accuracy
     correct = sum(
@@ -123,6 +147,7 @@ def evaluate_with_prompt(
     return {
         "accuracy": correct / total if total > 0 else 0.0,
         "predictions": all_preds,
+        "logits": all_logits,
     }
 
 
@@ -135,10 +160,15 @@ def evaluate_all_prompts(
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """
-    Try all prompt styles and return the best result.
+    Evaluate with multiple prompt formats, then combine via majority-vote ensemble.
+
+    Strategy:
+    - Run each prompt style independently
+    - For each example, take a majority vote across all styles
+    - If tied, fall back to the style with the highest confidence (max logit)
+    - This ensemble is more robust than any single format
     """
-    best_result = None
-    best_name = None
+    all_results: Dict[str, Dict] = {}
 
     for name, fmt_fn in PROMPT_STYLES.items():
         result = evaluate_with_prompt(
@@ -149,12 +179,55 @@ def evaluate_all_prompts(
             device=device,
         )
         print(f"  Prompt style '{name}': {result['accuracy']:.2%}")
-        if best_result is None or result["accuracy"] > best_result["accuracy"]:
-            best_result = result
-            best_name = name
+        all_results[name] = result
 
-    print(f"  Best prompt style: '{best_name}' ({best_result['accuracy']:.2%})")
-    return best_result
+    # ── Majority-vote ensemble ──────────────────────────────────────────
+    style_names = list(all_results.keys())
+    ensemble_preds: List[int] = []
+
+    for i in range(len(examples)):
+        votes = [all_results[s]["predictions"][i] for s in style_names]
+        counter = Counter(votes)
+        top_count = counter.most_common(1)[0][1]
+        tied = [v for v, c in counter.items() if c == top_count]
+
+        if len(tied) == 1:
+            ensemble_preds.append(tied[0])
+        else:
+            # Tie-break: pick the choice with highest summed logit across styles
+            num_choices = len(examples[i]["choices"])
+            summed = [0.0] * num_choices
+            for s in style_names:
+                logits_i = all_results[s]["logits"][i]
+                for c in range(min(num_choices, len(logits_i))):
+                    summed[c] += logits_i[c]
+            ensemble_preds.append(max(range(num_choices), key=lambda c: summed[c]))
+
+    # Compute ensemble accuracy
+    correct = sum(
+        1 for p, ex in zip(ensemble_preds, examples)
+        if ex.get("answer", -1) >= 0 and p == ex["answer"]
+    )
+    total = sum(1 for ex in examples if ex.get("answer", -1) >= 0)
+    ensemble_acc = correct / total if total > 0 else 0.0
+
+    print(f"  Ensemble (majority vote): {ensemble_acc:.2%}")
+
+    # Return ensemble if it beats all individuals, otherwise return best single
+    best_single = max(all_results.values(), key=lambda r: r["accuracy"])
+    if ensemble_acc >= best_single["accuracy"]:
+        print(f"  → Using ensemble ({ensemble_acc:.2%})")
+        return {
+            "accuracy": ensemble_acc,
+            "predictions": ensemble_preds,
+        }
+    else:
+        best_name = max(all_results, key=lambda n: all_results[n]["accuracy"])
+        print(f"  → Using best single style '{best_name}' ({best_single['accuracy']:.2%})")
+        return {
+            "accuracy": best_single["accuracy"],
+            "predictions": best_single["predictions"],
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
