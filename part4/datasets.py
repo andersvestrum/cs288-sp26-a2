@@ -1,6 +1,5 @@
 """
 Dataset classes for pre-training and fine-tuning.
-Example submission.
 """
 import json
 import torch
@@ -49,6 +48,23 @@ class MultipleChoiceQADataset(Dataset):
     def _format_choice_input(self, context: str, question: str, choice: str) -> str:
         return f"{context}\n\nQuestion: {question}\n\nAnswer: {choice}"
     
+    def _encode_with_smart_truncation(self, context: str, question: str, choice: str) -> List[int]:
+        """Encode while preserving question + answer, trimming context if needed."""
+        suffix = f"\n\nQuestion: {question}\n\nAnswer: {choice}"
+        suffix_ids = self.tokenizer.encode(suffix)
+        
+        context_ids = self.tokenizer.encode(context)
+        max_context = self.max_length - len(suffix_ids) - 1  # leave room
+        if max_context < 0:
+            max_context = 0
+        if len(context_ids) > max_context:
+            context_ids = context_ids[:max_context]
+        
+        token_ids = context_ids + suffix_ids
+        if len(token_ids) > self.max_length:
+            token_ids = token_ids[:self.max_length]
+        return token_ids
+    
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         example = self.data[idx]
         context = example["context"]
@@ -60,10 +76,7 @@ class MultipleChoiceQADataset(Dataset):
         all_attention_masks = []
         
         for choice in choices:
-            text = self._format_choice_input(context, question, choice)
-            token_ids = self.tokenizer.encode(text)
-            if len(token_ids) > self.max_length:
-                token_ids = token_ids[:self.max_length]
+            token_ids = self._encode_with_smart_truncation(context, question, choice)
             attention_mask = [1] * len(token_ids)
             padding_length = self.max_length - len(token_ids)
             token_ids = token_ids + [0] * padding_length

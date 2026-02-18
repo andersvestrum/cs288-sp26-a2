@@ -49,6 +49,7 @@ CONFIGS = {
         "pretrain_data": Path(__file__).parent.parent / "part1/fixtures/tinystories_sample_5M.txt",
         "qa_train": Path(__file__).parent / "fixtures/qa_train.json",
         "qa_dev": Path(__file__).parent / "fixtures/qa_dev.json",
+        "qa_test": Path(__file__).parent / "fixtures/qa_dev.json",  # no separate test for quick
         "vocab_size": 512,
         "d_model": 128,
         "num_layers": 4,
@@ -65,6 +66,7 @@ CONFIGS = {
         "pretrain_data": Path(__file__).parent / "fixtures/tinystories_100k.txt",
         "qa_train": Path(__file__).parent / "fixtures/squad_train.json",
         "qa_dev": Path(__file__).parent / "fixtures/squad_dev.json",
+        "qa_test": Path(__file__).parent / "fixtures/squad_test.json",
         "vocab_size": 4096,
         "d_model": 256,
         "num_layers": 6,
@@ -81,6 +83,7 @@ CONFIGS = {
         "pretrain_data": Path(__file__).parent / "fixtures/tinystories_100k.txt",
         "qa_train": Path(__file__).parent / "fixtures/squad_train.json",
         "qa_dev": Path(__file__).parent / "fixtures/squad_dev.json",
+        "qa_test": Path(__file__).parent / "fixtures/squad_test.json",
         "vocab_size": 8192,
         "d_model": 512,
         "num_layers": 8,
@@ -250,49 +253,109 @@ def evaluate_prompting(
     tokenizer,
     qa_dev_path: Path,
     device: str = "cpu",
+    qa_train_path: Path = None,
 ) -> dict:
     """
-    Evaluate the pretrained model using zero-shot prompting.
+    Evaluate the model using multiple prompting strategies and return the best.
     
-    This tests if the model can answer questions without any fine-tuning,
-    just by predicting which answer token (A, B, C, D) is most likely.
+    Tries:
+      - token scoring with several templates
+      - choice_ll scoring with several templates
+      - few-shot prompting with choice_ll
     
     Args:
-        model: Pretrained TransformerLM
+        model: TransformerLM (fine-tuned backbone)
         tokenizer: Tokenizer
         qa_dev_path: Path to validation QA data
         device: Device
+        qa_train_path: Optional path to training data for few-shot exemplars
     
     Returns:
-        Evaluation results dict
+        Best evaluation results dict
     """
     print("\n" + "=" * 60)
-    print("STEP 4: Evaluating Prompting (on fine-tuned model)")
+    print("STEP 4: Evaluating Prompting (multiple strategies)")
     print("=" * 60)
     
     # Load data
     with open(qa_dev_path) as f:
         dev_data = json.load(f)
     
+    train_data = []
+    if qa_train_path and Path(qa_train_path).exists():
+        with open(qa_train_path) as f:
+            train_data = json.load(f)
+    
     print(f"\nValidation examples: {len(dev_data)}")
     
-    # Create pipeline
-    template = PromptTemplate(template_name="simple")
-    pipeline = PromptingPipeline(
-        model=model,
-        tokenizer=tokenizer,
-        template=template,
-        device=device,
-    )
-    
-    # Evaluate
     from part4.prompting import evaluate_prompting as eval_prompt
-    results = eval_prompt(pipeline, dev_data)
     
-    print(f"\nPrompting accuracy (on fine-tuned model): {results['accuracy']:.2%}")
-    print(f"Random baseline: 25.00%")
+    best_acc = 0.0
+    best_results = None
+    best_label = ""
     
-    return results
+    # Strategy 1: token scoring with different templates
+    for tmpl_name in ["basic", "simple", "instruction", "direct"]:
+        template = PromptTemplate(template_name=tmpl_name)
+        pipeline = PromptingPipeline(
+            model=model, tokenizer=tokenizer,
+            template=template, device=device,
+            scoring_method="token",
+        )
+        results = eval_prompt(pipeline, dev_data)
+        acc = results["accuracy"]
+        label = f"token + {tmpl_name}"
+        print(f"  {label}: {acc:.2%}")
+        if acc > best_acc:
+            best_acc = acc
+            best_results = results
+            best_label = label
+    
+    # Strategy 2: choice_ll scoring with different templates
+    for tmpl_name in ["basic", "simple", "instruction", "direct"]:
+        template = PromptTemplate(template_name=tmpl_name)
+        pipeline = PromptingPipeline(
+            model=model, tokenizer=tokenizer,
+            template=template, device=device,
+            scoring_method="choice_ll",
+        )
+        results = eval_prompt(pipeline, dev_data)
+        acc = results["accuracy"]
+        label = f"choice_ll + {tmpl_name}"
+        print(f"  {label}: {acc:.2%}")
+        if acc > best_acc:
+            best_acc = acc
+            best_results = results
+            best_label = label
+    
+    # Strategy 3: few-shot with choice_ll
+    if train_data:
+        for num_shots in [1, 3, 5]:
+            for tmpl_name in ["basic", "simple"]:
+                template = PromptTemplate(
+                    template_name=tmpl_name,
+                    few_shot_data=train_data[:20],
+                    num_shots=num_shots,
+                )
+                pipeline = PromptingPipeline(
+                    model=model, tokenizer=tokenizer,
+                    template=template, device=device,
+                    scoring_method="choice_ll",
+                )
+                results = eval_prompt(pipeline, dev_data)
+                acc = results["accuracy"]
+                label = f"choice_ll + {tmpl_name} + {num_shots}-shot"
+                print(f"  {label}: {acc:.2%}")
+                if acc > best_acc:
+                    best_acc = acc
+                    best_results = results
+                    best_label = label
+    
+    print(f"\n  BEST: {best_label} -> {best_acc:.2%}")
+    print(f"  Random baseline: 25.00%")
+    
+    best_results["strategy"] = best_label
+    return best_results
 
 
 # =============================================================================
@@ -499,30 +562,93 @@ Examples:
     # Step 3: Fine-tune for QA
     qa_model = finetune_qa(pretrained_model, tokenizer, config, device)
     
-    # Step 4: Evaluate prompting on fine-tuned model
+    # Step 4: Evaluate prompting on fine-tuned model (dev set — find best strategy)
     # Use the fine-tuned backbone (qa_model.transformer) for prompting
-    prompting_results = evaluate_prompting(
+    prompting_dev_results = evaluate_prompting(
         qa_model.transformer, tokenizer,
-        config["qa_dev"], device
+        config["qa_dev"], device,
+        qa_train_path=config["qa_train"],
     )
     
-    # Step 5: Evaluate fine-tuned model (classification head)
-    finetuned_results = evaluate_finetuned(qa_model, tokenizer, config, device)
+    # Step 5: Evaluate fine-tuned model on dev set (classification head)
+    finetuned_dev_results = evaluate_finetuned(qa_model, tokenizer, config, device)
     
-    # Summary
+    # =========================================================================
+    # Step 6: Generate TEST SET predictions for Gradescope submission
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("STEP 6: Generating TEST SET predictions for submission")
+    print("=" * 60)
+    
+    qa_test_path = config.get("qa_test", config["qa_dev"])
+    with open(qa_test_path) as f:
+        test_data = json.load(f)
+    print(f"\nTest examples: {len(test_data)}")
+    
+    # --- Fine-tuned test predictions ---
+    print("\nGenerating fine-tuned test predictions...")
+    test_dataloader = create_qa_dataloader(
+        data=test_data,
+        tokenizer=tokenizer,
+        batch_size=config["batch_size"],
+        max_length=config["context_length"],
+        num_choices=4,
+        shuffle=False,
+    )
+    finetuned_test_results = evaluate_qa_model(qa_model, test_dataloader, device)
+    print(f"  Fine-tuned test accuracy: {finetuned_test_results['accuracy']:.2%}")
+    
+    # --- Prompting test predictions using the best strategy found on dev ---
+    best_strategy = prompting_dev_results.get("strategy", "choice_ll + basic")
+    print(f"\nGenerating prompting test predictions using best dev strategy: {best_strategy}")
+    
+    # Parse best strategy to reconstruct the pipeline
+    from part4.prompting import evaluate_prompting as eval_prompt
+    
+    train_data = []
+    if config["qa_train"].exists():
+        with open(config["qa_train"]) as f:
+            train_data = json.load(f)
+    
+    # Parse strategy string: "choice_ll + basic + 3-shot" or "token + simple"
+    parts = [p.strip() for p in best_strategy.split("+")]
+    scoring_method = parts[0] if parts else "choice_ll"
+    tmpl_name = parts[1] if len(parts) > 1 else "basic"
+    num_shots = 0
+    if len(parts) > 2 and "-shot" in parts[2]:
+        num_shots = int(parts[2].replace("-shot", ""))
+    
+    template_kwargs = {"template_name": tmpl_name}
+    if num_shots > 0 and train_data:
+        template_kwargs["few_shot_data"] = train_data[:20]
+        template_kwargs["num_shots"] = num_shots
+    
+    template = PromptTemplate(**template_kwargs)
+    pipeline = PromptingPipeline(
+        model=qa_model.transformer, tokenizer=tokenizer,
+        template=template, device=device,
+        scoring_method=scoring_method,
+    )
+    prompting_test_results = eval_prompt(pipeline, test_data)
+    print(f"  Prompting test accuracy: {prompting_test_results['accuracy']:.2%}")
+    
+    # Summary (dev set results for reference)
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
     print(f"\nConfiguration: {config_name}")
     print(f"Model parameters: {sum(p.numel() for p in pretrained_model.parameters()):,}")
-    print(f"\nResults (both on fine-tuned model):")
-    print(f"  Prompting approach:    {prompting_results['accuracy']:.2%}")
-    print(f"  Classification head:   {finetuned_results['accuracy']:.2%}")
+    print(f"\nDEV SET results (used for strategy selection):")
+    print(f"  Prompting approach:    {prompting_dev_results['accuracy']:.2%}")
+    print(f"  Classification head:   {finetuned_dev_results['accuracy']:.2%}")
+    print(f"\nTEST SET results (submitted to Gradescope):")
+    print(f"  Prompting approach:    {prompting_test_results['accuracy']:.2%}")
+    print(f"  Classification head:   {finetuned_test_results['accuracy']:.2%}")
     print(f"  Random baseline:       25.00%")
     
-    # Calculate improvement (prompting should beat finetuned for full prompting score)
-    prompting_boost = prompting_results['accuracy'] - finetuned_results['accuracy']
-    print(f"\n  Prompting boost over fine-tuned: {prompting_boost:+.2%}")
+    # Calculate improvement on TEST set
+    prompting_boost = prompting_test_results['accuracy'] - finetuned_test_results['accuracy']
+    print(f"\n  Prompting boost over fine-tuned (test): {prompting_boost:+.2%}")
     if prompting_boost >= 0.04:
         print(f"  (4%+ boost = full prompting score)")
     elif prompting_boost > 0:
@@ -530,39 +656,44 @@ Examples:
     else:
         print(f"  (Prompting should beat fine-tuned model)")
     
-    # Save predictions to JSON files for grading
+    # Save TEST predictions to JSON files for Gradescope grading
     output_dir = Path(__file__).parent / "outputs"
     output_dir.mkdir(exist_ok=True)
     
-    # Save fine-tuned predictions
+    # Save fine-tuned TEST predictions
     finetuned_output = {
-        "predictions": finetuned_results.get("predictions", []),
-        "accuracy": finetuned_results["accuracy"],
+        "predictions": finetuned_test_results.get("predictions", []),
+        "accuracy": finetuned_test_results["accuracy"],
+        "dev_accuracy": finetuned_dev_results["accuracy"],
         "config": config_name,
+        "split": "test",
     }
     finetuned_path = output_dir / "finetuned_predictions.json"
     with open(finetuned_path, "w") as f:
         json.dump(finetuned_output, f, indent=2)
     
-    # Save prompting predictions
+    # Save prompting TEST predictions
     prompting_output = {
-        "predictions": prompting_results.get("predictions", []),
-        "accuracy": prompting_results["accuracy"],
+        "predictions": prompting_test_results.get("predictions", []),
+        "accuracy": prompting_test_results["accuracy"],
+        "dev_accuracy": prompting_dev_results["accuracy"],
         "config": config_name,
+        "strategy": best_strategy,
+        "split": "test",
     }
     prompting_path = output_dir / "prompting_predictions.json"
     with open(prompting_path, "w") as f:
         json.dump(prompting_output, f, indent=2)
     
-    print(f"\nPredictions saved to:")
+    print(f"\nTEST predictions saved to:")
     print(f"  {finetuned_path}")
     print(f"  {prompting_path}")
     
-    # Print grading info
+    # Print grading info (estimated from test results)
     print("\n" + "=" * 60)
-    print("GRADING RUBRIC")
+    print("ESTIMATED GRADING (based on test set)")
     print("=" * 60)
-    finetuned_score = max(0, min(1, (finetuned_results['accuracy'] - 0.30) / 0.20))
+    finetuned_score = max(0, min(1, (finetuned_test_results['accuracy'] - 0.30) / 0.20))
     prompting_score = max(0, min(1, prompting_boost / 0.04)) if prompting_boost > 0 else 0
     total_score = 0.5 * finetuned_score + 0.5 * prompting_score
     

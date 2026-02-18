@@ -29,9 +29,11 @@ class TransformerForMultipleChoice(nn.Module):
                 param.requires_grad = False
     
     def _get_hidden_states(self, input_ids: Tensor) -> Tensor:
+        batch_size, seq_len = input_ids.shape
+        token_positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         x = self.transformer.token_embeddings(input_ids)
         for layer in self.transformer.layers:
-            x = layer(x)
+            x = layer(x, token_positions)
         x = self.transformer.final_ln(x)
         return x
     
@@ -54,14 +56,22 @@ class TransformerForMultipleChoice(nn.Module):
             return hidden_states.max(dim=1).values
         raise ValueError(f"Unknown pooling: {self.pooling}")
     
-    def forward(self, input_ids: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
+    def forward(self, input_ids: Tensor, attention_mask: Optional[Tensor] = None, return_lm_logits: bool = False) -> Tensor:
         batch_size, num_choices, seq_len = input_ids.shape
         input_ids_flat = input_ids.view(-1, seq_len)
         attention_mask_flat = attention_mask.view(-1, seq_len) if attention_mask is not None else None
         hidden_states = self._get_hidden_states(input_ids_flat)
         pooled = self._pool(hidden_states, attention_mask_flat)
         logits = self.classifier(pooled).squeeze(-1)
-        return logits.view(batch_size, num_choices)
+        choice_logits = logits.view(batch_size, num_choices)
+        
+        if return_lm_logits:
+            # Also compute LM logits through the output projection head
+            # so the auxiliary LM loss can keep it aligned with the backbone
+            lm_logits = self.transformer.output(hidden_states)  # (batch*num_choices, seq_len, vocab)
+            return choice_logits, lm_logits, input_ids_flat
+        
+        return choice_logits
     
     @torch.no_grad()
     def predict(self, input_ids: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
