@@ -1,12 +1,13 @@
 """
 Training utilities.
+Example submission.
 """
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, Callable
 from pathlib import Path
 import time
@@ -33,7 +34,6 @@ class TrainingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = False
     patience: Optional[int] = None
-    label_smoothing: float = 0.0
 
 
 class Trainer:
@@ -93,22 +93,19 @@ class Trainer:
         return total_loss / num_batches if num_batches > 0 else 0.0
     
     def train(self) -> Dict[str, Any]:
-        print(f"  Training {self.config.num_epochs} epochs, {len(self.train_dataloader)} batches/epoch")
         for epoch in range(self.config.num_epochs):
-            t0 = time.time()
             train_loss = self.train_epoch()
-            dt = time.time() - t0
             self.train_losses.append(train_loss)
-            msg = f"  Epoch {epoch+1}/{self.config.num_epochs}: loss={train_loss:.4f} ({dt:.1f}s)"
             if self.val_dataloader:
                 val_loss = self.evaluate()
                 self.val_losses.append(val_loss)
-                msg += f" val_loss={val_loss:.4f}"
-            print(msg)
         return {"train_losses": self.train_losses, "val_losses": self.val_losses}
 
 
-def compute_qa_loss(batch: Dict[str, torch.Tensor], model: nn.Module, device: str = "cuda") -> torch.Tensor:
+def compute_qa_loss(
+    batch: Dict[str, torch.Tensor], model: nn.Module, device: str = "cuda"
+) -> torch.Tensor:
+    """Compute QA classification cross-entropy loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     labels = batch["labels"].to(device)
@@ -117,4 +114,5 @@ def compute_qa_loss(batch: Dict[str, torch.Tensor], model: nn.Module, device: st
 
 
 def create_qa_loss_fn(device: str = "cuda") -> Callable:
+    """Create a QA loss function."""
     return lambda batch, model: compute_qa_loss(batch, model, device)

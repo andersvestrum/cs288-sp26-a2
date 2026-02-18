@@ -35,7 +35,7 @@ from part3.nn_utils import cross_entropy, gradient_clipping
 from part4.datasets import create_pretraining_dataloader, create_qa_dataloader
 from part4.sampling import generate_text
 from part4.qa_model import TransformerForMultipleChoice, evaluate_qa_model
-from part4.prompting import PromptTemplate, PromptingPipeline, evaluate_prompting
+from part4.prompting import evaluate_all_prompts
 from part4.trainer import Trainer, TrainingConfig, create_qa_loss_fn
 
 
@@ -49,7 +49,6 @@ CONFIGS = {
         "pretrain_data": Path(__file__).parent.parent / "part1/fixtures/tinystories_sample_5M.txt",
         "qa_train": Path(__file__).parent / "fixtures/qa_train.json",
         "qa_dev": Path(__file__).parent / "fixtures/qa_dev.json",
-        "qa_test": Path(__file__).parent / "fixtures/qa_dev.json",  # no separate test for quick
         "vocab_size": 512,
         "d_model": 128,
         "num_layers": 4,
@@ -66,7 +65,6 @@ CONFIGS = {
         "pretrain_data": Path(__file__).parent / "fixtures/tinystories_100k.txt",
         "qa_train": Path(__file__).parent / "fixtures/squad_train.json",
         "qa_dev": Path(__file__).parent / "fixtures/squad_dev.json",
-        "qa_test": Path(__file__).parent / "fixtures/squad_test.json",
         "vocab_size": 4096,
         "d_model": 256,
         "num_layers": 6,
@@ -83,7 +81,6 @@ CONFIGS = {
         "pretrain_data": Path(__file__).parent / "fixtures/tinystories_100k.txt",
         "qa_train": Path(__file__).parent / "fixtures/squad_train.json",
         "qa_dev": Path(__file__).parent / "fixtures/squad_dev.json",
-        "qa_test": Path(__file__).parent / "fixtures/squad_test.json",
         "vocab_size": 8192,
         "d_model": 512,
         "num_layers": 8,
@@ -248,114 +245,54 @@ def pretrain_lm(
 # Step 3: Evaluate Zero-Shot Prompting
 # =============================================================================
 
-def evaluate_prompting(
-    model: TransformerLM,
+def evaluate_prompting_step(
+    qa_model,
     tokenizer,
     qa_dev_path: Path,
+    config: dict,
     device: str = "cpu",
-    qa_train_path: Path = None,
 ) -> dict:
     """
-    Evaluate the model using multiple prompting strategies and return the best.
+    Evaluate the fine-tuned classification model with different prompt formats.
     
-    Tries:
-      - token scoring with several templates
-      - choice_ll scoring with several templates
-      - few-shot prompting with choice_ll
+    Same TransformerForMultipleChoice model as 4A, but we experiment with
+    how the context/question/choice text is formatted before feeding it
+    to the classification head.
     
     Args:
-        model: TransformerLM (fine-tuned backbone)
+        qa_model: Fine-tuned TransformerForMultipleChoice
         tokenizer: Tokenizer
         qa_dev_path: Path to validation QA data
+        config: Configuration dict
         device: Device
-        qa_train_path: Optional path to training data for few-shot exemplars
     
     Returns:
         Best evaluation results dict
     """
     print("\n" + "=" * 60)
-    print("STEP 4: Evaluating Prompting (multiple strategies)")
+    print("STEP 4: Evaluating Prompting (classification head, different formats)")
     print("=" * 60)
     
     # Load data
     with open(qa_dev_path) as f:
         dev_data = json.load(f)
     
-    train_data = []
-    if qa_train_path and Path(qa_train_path).exists():
-        with open(qa_train_path) as f:
-            train_data = json.load(f)
-    
     print(f"\nValidation examples: {len(dev_data)}")
+    print(f"Trying different prompt formats...\n")
     
-    from part4.prompting import evaluate_prompting as eval_prompt
+    results = evaluate_all_prompts(
+        qa_model=qa_model,
+        tokenizer=tokenizer,
+        examples=dev_data,
+        max_length=config["context_length"],
+        batch_size=config["batch_size"],
+        device=device,
+    )
     
-    best_acc = 0.0
-    best_results = None
-    best_label = ""
+    print(f"\nBest prompting accuracy: {results['accuracy']:.2%}")
+    print(f"Random baseline: 25.00%")
     
-    # Strategy 1: token scoring with different templates
-    for tmpl_name in ["basic", "simple", "instruction", "direct"]:
-        template = PromptTemplate(template_name=tmpl_name)
-        pipeline = PromptingPipeline(
-            model=model, tokenizer=tokenizer,
-            template=template, device=device,
-            scoring_method="token",
-        )
-        results = eval_prompt(pipeline, dev_data)
-        acc = results["accuracy"]
-        label = f"token + {tmpl_name}"
-        print(f"  {label}: {acc:.2%}")
-        if acc > best_acc:
-            best_acc = acc
-            best_results = results
-            best_label = label
-    
-    # Strategy 2: choice_ll scoring with different templates
-    for tmpl_name in ["basic", "simple", "instruction", "direct"]:
-        template = PromptTemplate(template_name=tmpl_name)
-        pipeline = PromptingPipeline(
-            model=model, tokenizer=tokenizer,
-            template=template, device=device,
-            scoring_method="choice_ll",
-        )
-        results = eval_prompt(pipeline, dev_data)
-        acc = results["accuracy"]
-        label = f"choice_ll + {tmpl_name}"
-        print(f"  {label}: {acc:.2%}")
-        if acc > best_acc:
-            best_acc = acc
-            best_results = results
-            best_label = label
-    
-    # Strategy 3: few-shot with choice_ll
-    if train_data:
-        for num_shots in [1, 3, 5]:
-            for tmpl_name in ["basic", "simple"]:
-                template = PromptTemplate(
-                    template_name=tmpl_name,
-                    few_shot_data=train_data[:20],
-                    num_shots=num_shots,
-                )
-                pipeline = PromptingPipeline(
-                    model=model, tokenizer=tokenizer,
-                    template=template, device=device,
-                    scoring_method="choice_ll",
-                )
-                results = eval_prompt(pipeline, dev_data)
-                acc = results["accuracy"]
-                label = f"choice_ll + {tmpl_name} + {num_shots}-shot"
-                print(f"  {label}: {acc:.2%}")
-                if acc > best_acc:
-                    best_acc = acc
-                    best_results = results
-                    best_label = label
-    
-    print(f"\n  BEST: {best_label} -> {best_acc:.2%}")
-    print(f"  Random baseline: 25.00%")
-    
-    best_results["strategy"] = best_label
-    return best_results
+    return results
 
 
 # =============================================================================
@@ -494,7 +431,6 @@ def evaluate_finetuned(
 # Main
 # =============================================================================
 
-
 def main():
     parser = argparse.ArgumentParser(
         description="Part 4 Baseline Training",
@@ -550,8 +486,12 @@ Examples:
     print(f"Device: {device}")
     
     # Step 1: Train tokenizer
+    # Use bpe_data if specified (faster for large configs), otherwise use pretrain_data
     bpe_data = config.get("bpe_data", config["pretrain_data"])
-    tokenizer, vocab, merges = train_tokenizer(bpe_data, config["vocab_size"])
+    tokenizer, vocab, merges = train_tokenizer(
+        bpe_data,
+        config["vocab_size"]
+    )
     
     # Step 2: Pretrain LM
     pretrained_model = pretrain_lm(tokenizer, config, device)
@@ -559,66 +499,78 @@ Examples:
     # Step 3: Fine-tune for QA
     qa_model = finetune_qa(pretrained_model, tokenizer, config, device)
     
-    # Step 4: Evaluate fine-tuned model on dev set (classification head)
-    # Do this BEFORE prompting so we confirm finetuning worked
-    finetuned_dev_results = evaluate_finetuned(qa_model, tokenizer, config, device)
-    
-    # Step 5: Evaluate prompting on fine-tuned backbone (dev set)
-    prompting_dev_results = evaluate_prompting(
-        qa_model.transformer, tokenizer,
-        config["qa_dev"], device,
-        qa_train_path=config["qa_train"],
+    # Step 4: Evaluate prompting on fine-tuned model
+    # Use the SAME classification model, but with different prompt formats
+    prompting_results = evaluate_prompting_step(
+        qa_model, tokenizer,
+        config["qa_dev"], config, device
     )
+    
+    # Step 5: Evaluate fine-tuned model (classification head)
+    finetuned_results = evaluate_finetuned(qa_model, tokenizer, config, device)
     
     # Summary
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    ft_n = len(finetuned_dev_results.get("predictions", []))
-    pr_n = len(prompting_dev_results.get("predictions", []))
     print(f"\nConfiguration: {config_name}")
     print(f"Model parameters: {sum(p.numel() for p in pretrained_model.parameters()):,}")
-    print(f"\nDEV SET results ({ft_n} examples):")
-    print(f"  Classification head:   {finetuned_dev_results['accuracy']:.2%}")
-    print(f"  Prompting approach:    {prompting_dev_results['accuracy']:.2%}")
+    print(f"\nResults (both on fine-tuned model):")
+    print(f"  Prompting approach:    {prompting_results['accuracy']:.2%}")
+    print(f"  Classification head:   {finetuned_results['accuracy']:.2%}")
     print(f"  Random baseline:       25.00%")
     
-    prompting_boost = prompting_dev_results["accuracy"] - finetuned_dev_results["accuracy"]
-    print(f"\n  Prompting boost: {prompting_boost:+.2%}")
+    # Calculate improvement (prompting should beat finetuned for full prompting score)
+    prompting_boost = prompting_results['accuracy'] - finetuned_results['accuracy']
+    print(f"\n  Prompting boost over fine-tuned: {prompting_boost:+.2%}")
+    if prompting_boost >= 0.04:
+        print(f"  (4%+ boost = full prompting score)")
+    elif prompting_boost > 0:
+        print(f"  (Need 4% boost for full prompting score)")
+    else:
+        print(f"  (Prompting should beat fine-tuned model)")
     
-    # Save DEV predictions for Gradescope
+    # Save predictions to JSON files for grading
     output_dir = Path(__file__).parent / "outputs"
     output_dir.mkdir(exist_ok=True)
     
+    # Save fine-tuned predictions
+    finetuned_output = {
+        "predictions": finetuned_results.get("predictions", []),
+        "accuracy": finetuned_results["accuracy"],
+        "config": config_name,
+    }
     finetuned_path = output_dir / "finetuned_predictions.json"
     with open(finetuned_path, "w") as f:
-        json.dump({
-            "predictions": finetuned_dev_results.get("predictions", []),
-            "accuracy": finetuned_dev_results["accuracy"],
-            "config": config_name,
-            "num_examples": ft_n,
-        }, f, indent=2)
+        json.dump(finetuned_output, f, indent=2)
     
+    # Save prompting predictions
+    prompting_output = {
+        "predictions": prompting_results.get("predictions", []),
+        "accuracy": prompting_results["accuracy"],
+        "config": config_name,
+    }
     prompting_path = output_dir / "prompting_predictions.json"
     with open(prompting_path, "w") as f:
-        json.dump({
-            "predictions": prompting_dev_results.get("predictions", []),
-            "accuracy": prompting_dev_results["accuracy"],
-            "config": config_name,
-            "strategy": prompting_dev_results.get("strategy", "unknown"),
-            "num_examples": pr_n,
-        }, f, indent=2)
+        json.dump(prompting_output, f, indent=2)
     
     print(f"\nPredictions saved to:")
-    print(f"  {finetuned_path} ({ft_n} predictions)")
-    print(f"  {prompting_path} ({pr_n} predictions)")
+    print(f"  {finetuned_path}")
+    print(f"  {prompting_path}")
     
-    # Grading estimate
-    finetuned_score = max(0, min(1, (finetuned_dev_results["accuracy"] - 0.30) / 0.20))
+    # Print grading info
+    print("\n" + "=" * 60)
+    print("GRADING RUBRIC")
+    print("=" * 60)
+    finetuned_score = max(0, min(1, (finetuned_results['accuracy'] - 0.30) / 0.20))
     prompting_score = max(0, min(1, prompting_boost / 0.04)) if prompting_boost > 0 else 0
     total_score = 0.5 * finetuned_score + 0.5 * prompting_score
-    print(f"\nEstimated scores: finetuned={finetuned_score:.0%}, prompting={prompting_score:.0%}, total={total_score:.0%}")
-    print("Done!")
+    
+    print(f"\nFine-tuned score:  {finetuned_score:.0%} (30%=0pts, 50%=full)")
+    print(f"Prompting score:   {prompting_score:.0%} (0% boost=0pts, 4% boost=full)")
+    print(f"Total Part 4:      {total_score:.0%}")
+    
+    print("\nDone!")
 
 
 if __name__ == "__main__":
