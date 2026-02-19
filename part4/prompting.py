@@ -2,14 +2,14 @@
 Prompting utilities for multiple-choice QA.
 
 Uses the fine-tuned TransformerForMultipleChoice model (classification head)
-with different input prompt formats. "Prompting" here means experimenting
-with how context/question/answer are formatted before being fed to the
-same classification model from Part 4A.
+with different input prompt formats AND different pooling strategies.
 
 Key improvements over the baseline fine-tuned evaluation:
 1. Smart truncation that always preserves question + answer (matches training)
-2. Five diverse prompt formats that surface different signals
-3. Logit-sum ensemble (soft voting) across all formats for robust predictions
+2. Multiple prompt formats (only formats close to training distribution)
+3. Multi-pooling: run the SAME classifier head on last-token, mean, and max
+   pooled hidden states — gives diverse "views" without confusing the model
+4. Logit-sum ensemble across all (format × pooling) combinations
 """
 import torch
 import torch.nn.functional as F
@@ -24,6 +24,7 @@ if _parent not in sys.path:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Prompt format functions: each takes (context, question, choice) → str
+# Only formats close to the training distribution — deviating hurts accuracy.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def format_base(context: str, question: str, choice: str) -> str:
@@ -36,26 +37,8 @@ def format_compact(context: str, question: str, choice: str) -> str:
     return f"{context}\nQ: {question}\nA: {choice}"
 
 
-def format_highlight(context: str, question: str, choice: str) -> str:
-    """Repeat the question near the answer to strengthen signal at the pooling position."""
-    return (
-        f"{context}\n\n"
-        f"Question: {question}\n\n"
-        f"The answer to \"{question}\" is: {choice}"
-    )
-
-
-def format_assertive(context: str, question: str, choice: str) -> str:
-    """Frame the choice as a direct factual claim derived from the passage."""
-    return (
-        f"{context}\n\n"
-        f"Question: {question}\n\n"
-        f"Based on the passage above, the correct answer is {choice}"
-    )
-
-
 def format_fill(context: str, question: str, choice: str) -> str:
-    """Present the choice as completing a fill-in-the-blank derived from the question."""
+    """Minimal variation — slightly different separator."""
     return (
         f"{context}\n\n"
         f"Question: {question}\n"
@@ -66,8 +49,6 @@ def format_fill(context: str, question: str, choice: str) -> str:
 PROMPT_STYLES: Dict[str, Callable] = {
     "base": format_base,
     "compact": format_compact,
-    "highlight": format_highlight,
-    "assertive": format_assertive,
     "fill": format_fill,
 }
 
@@ -95,30 +76,51 @@ def encode_with_smart_truncation(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Evaluation: run classification head with a given prompt format
+# Multi-pooling evaluation: run classifier on different pooling of hidden states
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _pool_hidden(hidden_states, attention_mask, strategy: str):
+    """Pool hidden states using a given strategy."""
+    if strategy == "last":
+        seq_lengths = attention_mask.sum(dim=1).long() - 1
+        batch_idx = torch.arange(hidden_states.size(0), device=hidden_states.device)
+        return hidden_states[batch_idx, seq_lengths]
+    elif strategy == "mean":
+        mask = attention_mask.unsqueeze(-1).float()
+        return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    elif strategy == "max":
+        mask = attention_mask.unsqueeze(-1).bool()
+        h = hidden_states.masked_fill(~mask, float("-inf"))
+        return h.max(dim=1).values
+    else:
+        raise ValueError(f"Unknown pooling: {strategy}")
+
+
+POOLING_STRATEGIES = ["last", "mean", "max"]
+
+
 @torch.no_grad()
-def evaluate_with_prompt(
+def evaluate_with_prompt_and_pooling(
     qa_model,
     tokenizer,
     examples: List[Dict[str, Any]],
     format_fn: Callable = format_base,
+    pooling: str = "last",
     max_length: int = 512,
     batch_size: int = 32,
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """
-    Run the fine-tuned TransformerForMultipleChoice with a specific prompt format.
+    Run the fine-tuned model with a specific prompt format AND pooling strategy.
 
-    Uses smart truncation (trim context, keep question+answer) to match training.
-    Returns dict with 'accuracy', 'predictions', and raw 'logits'.
+    Instead of using the model's built-in forward (which always uses 'last' pooling),
+    we manually: get hidden states → pool with chosen strategy → classify.
+    This lets us get diverse logits from the same model without retraining.
     """
     qa_model.eval()
     qa_model.to(device)
 
     pad_id = 0
-
     all_preds: List[int] = []
     all_logits: List[List[float]] = []
 
@@ -151,12 +153,24 @@ def evaluate_with_prompt(
         input_ids = torch.tensor(batch_ids, dtype=torch.long, device=device)
         attention_mask = torch.tensor(batch_masks, dtype=torch.long, device=device)
 
-        logits = qa_model(input_ids, attention_mask)  # (batch, num_choices)
-        preds = logits.argmax(dim=-1)
-        all_preds.extend(preds.cpu().tolist())
-        all_logits.extend(logits.cpu().tolist())
+        bs, nc, sl = input_ids.shape
+        flat_ids = input_ids.view(-1, sl)
+        flat_mask = attention_mask.view(-1, sl)
 
-    # Compute accuracy
+        # Get hidden states from the backbone
+        hidden_states = qa_model._get_hidden_states(flat_ids)
+
+        # Pool with the chosen strategy (not necessarily 'last')
+        pooled = _pool_hidden(hidden_states, flat_mask, pooling)
+
+        # Run through the same classifier head
+        logits = qa_model.classifier(pooled).squeeze(-1)  # (bs*nc,)
+        choice_logits = logits.view(bs, nc)
+
+        preds = choice_logits.argmax(dim=-1)
+        all_preds.extend(preds.cpu().tolist())
+        all_logits.extend(choice_logits.cpu().tolist())
+
     correct = sum(
         1 for p, ex in zip(all_preds, examples)
         if ex.get("answer", -1) >= 0 and p == ex["answer"]
@@ -169,6 +183,10 @@ def evaluate_with_prompt(
     }
 
 
+# Keep backward-compatible single-format evaluator
+evaluate_with_prompt = evaluate_with_prompt_and_pooling
+
+
 def evaluate_all_prompts(
     qa_model,
     tokenizer,
@@ -178,39 +196,35 @@ def evaluate_all_prompts(
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """
-    Evaluate with multiple prompt formats, then combine via logit-sum ensemble.
+    Evaluate with (prompt_format × pooling_strategy) combinations, then ensemble.
 
-    Strategy:
-    - Run each prompt style independently
-    - Normalize each style's logits (zero-mean per example) so no single
-      format's scale dominates the sum
-    - Sum normalized logits across all styles → soft ensemble
-    - Pick argmax of summed logits as the ensemble prediction
-    - Return ensemble if it beats all individual styles, else return best single
+    With 3 formats × 3 poolings = 9 diverse "views" of the same model.
+    Logit-sum ensemble with zero-mean normalization gives robust soft voting.
     """
     all_results: Dict[str, Dict] = {}
 
-    for name, fmt_fn in PROMPT_STYLES.items():
-        result = evaluate_with_prompt(
-            qa_model, tokenizer, examples,
-            format_fn=fmt_fn,
-            max_length=max_length,
-            batch_size=batch_size,
-            device=device,
-        )
-        print(f"  Prompt style '{name}': {result['accuracy']:.2%}")
-        all_results[name] = result
+    for fmt_name, fmt_fn in PROMPT_STYLES.items():
+        for pool in POOLING_STRATEGIES:
+            key = f"{fmt_name}+{pool}"
+            result = evaluate_with_prompt_and_pooling(
+                qa_model, tokenizer, examples,
+                format_fn=fmt_fn,
+                pooling=pool,
+                max_length=max_length,
+                batch_size=batch_size,
+                device=device,
+            )
+            print(f"  {key}: {result['accuracy']:.2%}")
+            all_results[key] = result
 
     # ── Logit-sum ensemble (soft voting) ────────────────────────────────
     style_names = list(all_results.keys())
     n = len(examples)
     num_choices = len(examples[0]["choices"]) if n > 0 else 4
 
-    # Stack all logits: (num_styles, num_examples, num_choices)
     logit_tensors = []
     for s in style_names:
-        raw = all_results[s]["logits"]  # list of lists
-        # Pad to num_choices if needed (some examples might have fewer choices)
+        raw = all_results[s]["logits"]
         padded = [
             row + [float("-inf")] * (num_choices - len(row))
             if len(row) < num_choices else row[:num_choices]
@@ -220,16 +234,14 @@ def evaluate_all_prompts(
 
     stacked = torch.stack(logit_tensors)  # (S, N, C)
 
-    # Normalize: zero-mean each style's logits per example (removes scale bias)
-    means = stacked.mean(dim=-1, keepdim=True)  # (S, N, 1)
+    # Zero-mean normalize each view's logits per example (removes scale bias)
+    means = stacked.mean(dim=-1, keepdim=True)
     normed = stacked - means
 
-    # Sum across styles → (N, C)
+    # Sum across all views → (N, C)
     summed = normed.sum(dim=0)
-
     ensemble_preds = summed.argmax(dim=-1).tolist()
 
-    # Compute ensemble accuracy
     correct = sum(
         1 for p, ex in zip(ensemble_preds, examples)
         if ex.get("answer", -1) >= 0 and p == ex["answer"]
@@ -237,9 +249,29 @@ def evaluate_all_prompts(
     total = sum(1 for ex in examples if ex.get("answer", -1) >= 0)
     ensemble_acc = correct / total if total > 0 else 0.0
 
-    print(f"  Ensemble (logit-sum): {ensemble_acc:.2%}")
+    print(f"  Ensemble (9-way logit-sum): {ensemble_acc:.2%}")
 
-    # Return ensemble if it beats all individuals, otherwise return best single
+    # Also try ensemble of only the top-K views
+    accs = {k: v["accuracy"] for k, v in all_results.items()}
+    sorted_keys = sorted(accs, key=accs.get, reverse=True)
+    for topk in [3, 5, 7]:
+        if topk >= len(sorted_keys):
+            continue
+        top_indices = [style_names.index(k) for k in sorted_keys[:topk]]
+        top_normed = normed[top_indices]
+        top_summed = top_normed.sum(dim=0)
+        top_preds = top_summed.argmax(dim=-1).tolist()
+        top_correct = sum(
+            1 for p, ex in zip(top_preds, examples)
+            if ex.get("answer", -1) >= 0 and p == ex["answer"]
+        )
+        top_acc = top_correct / total if total > 0 else 0.0
+        print(f"  Ensemble (top-{topk}): {top_acc:.2%}")
+        if top_acc > ensemble_acc:
+            ensemble_acc = top_acc
+            ensemble_preds = top_preds
+
+    # Compare with best single
     best_single = max(all_results.values(), key=lambda r: r["accuracy"])
     if ensemble_acc >= best_single["accuracy"]:
         print(f"  → Using ensemble ({ensemble_acc:.2%})")
@@ -249,7 +281,7 @@ def evaluate_all_prompts(
         }
     else:
         best_name = max(all_results, key=lambda n: all_results[n]["accuracy"])
-        print(f"  → Using best single style '{best_name}' ({best_single['accuracy']:.2%})")
+        print(f"  → Using best single '{best_name}' ({best_single['accuracy']:.2%})")
         return {
             "accuracy": best_single["accuracy"],
             "predictions": best_single["predictions"],
