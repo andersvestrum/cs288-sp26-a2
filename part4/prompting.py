@@ -8,11 +8,11 @@ same classification model from Part 4A.
 
 Key improvements over the baseline fine-tuned evaluation:
 1. Smart truncation that always preserves question + answer (matches training)
-2. Multiple complementary prompt formats
-3. Majority-vote ensemble across formats for robust predictions
+2. Five diverse prompt formats that surface different signals
+3. Logit-sum ensemble (soft voting) across all formats for robust predictions
 """
 import torch
-from collections import Counter
+import torch.nn.functional as F
 from typing import List, Dict, Any, Optional, Callable
 import sys
 from pathlib import Path
@@ -27,12 +27,17 @@ if _parent not in sys.path:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def format_base(context: str, question: str, choice: str) -> str:
-    """Baseline format — identical to fine-tuning."""
+    """Baseline format — identical to fine-tuning training format."""
     return f"{context}\n\nQuestion: {question}\n\nAnswer: {choice}"
 
 
+def format_compact(context: str, question: str, choice: str) -> str:
+    """Compact style — fewer separator tokens so more context fits in."""
+    return f"{context}\nQ: {question}\nA: {choice}"
+
+
 def format_highlight(context: str, question: str, choice: str) -> str:
-    """Repeat the question near the answer to strengthen the signal."""
+    """Repeat the question near the answer to strengthen signal at the pooling position."""
     return (
         f"{context}\n\n"
         f"Question: {question}\n\n"
@@ -40,15 +45,30 @@ def format_highlight(context: str, question: str, choice: str) -> str:
     )
 
 
-def format_compact(context: str, question: str, choice: str) -> str:
-    """Compact style — less padding tokens, more context fits."""
-    return f"{context}\nQ: {question}\nA: {choice}"
+def format_assertive(context: str, question: str, choice: str) -> str:
+    """Frame the choice as a direct factual claim derived from the passage."""
+    return (
+        f"{context}\n\n"
+        f"Question: {question}\n\n"
+        f"Based on the passage above, the correct answer is {choice}"
+    )
+
+
+def format_fill(context: str, question: str, choice: str) -> str:
+    """Present the choice as completing a fill-in-the-blank derived from the question."""
+    return (
+        f"{context}\n\n"
+        f"Question: {question}\n"
+        f"The answer is: {choice}"
+    )
 
 
 PROMPT_STYLES: Dict[str, Callable] = {
     "base": format_base,
-    "highlight": format_highlight,
     "compact": format_compact,
+    "highlight": format_highlight,
+    "assertive": format_assertive,
+    "fill": format_fill,
 }
 
 
@@ -111,11 +131,9 @@ def evaluate_with_prompt(
             choice_ids_list = []
             choice_mask_list = []
             for choice in ex["choices"]:
-                # Build the suffix (question + answer portion) separately
-                # so we can do smart truncation on the context only
                 full_text = format_fn(ex["context"], ex["question"], choice)
                 context_text = ex["context"]
-                suffix_text = full_text[len(context_text):]  # everything after context
+                suffix_text = full_text[len(context_text):]
 
                 ids = encode_with_smart_truncation(
                     tokenizer, context_text, suffix_text, max_length
@@ -160,13 +178,15 @@ def evaluate_all_prompts(
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """
-    Evaluate with multiple prompt formats, then combine via majority-vote ensemble.
+    Evaluate with multiple prompt formats, then combine via logit-sum ensemble.
 
     Strategy:
     - Run each prompt style independently
-    - For each example, take a majority vote across all styles
-    - If tied, fall back to the style with the highest confidence (max logit)
-    - This ensemble is more robust than any single format
+    - Normalize each style's logits (zero-mean per example) so no single
+      format's scale dominates the sum
+    - Sum normalized logits across all styles → soft ensemble
+    - Pick argmax of summed logits as the ensemble prediction
+    - Return ensemble if it beats all individual styles, else return best single
     """
     all_results: Dict[str, Dict] = {}
 
@@ -181,27 +201,33 @@ def evaluate_all_prompts(
         print(f"  Prompt style '{name}': {result['accuracy']:.2%}")
         all_results[name] = result
 
-    # ── Majority-vote ensemble ──────────────────────────────────────────
+    # ── Logit-sum ensemble (soft voting) ────────────────────────────────
     style_names = list(all_results.keys())
-    ensemble_preds: List[int] = []
+    n = len(examples)
+    num_choices = len(examples[0]["choices"]) if n > 0 else 4
 
-    for i in range(len(examples)):
-        votes = [all_results[s]["predictions"][i] for s in style_names]
-        counter = Counter(votes)
-        top_count = counter.most_common(1)[0][1]
-        tied = [v for v, c in counter.items() if c == top_count]
+    # Stack all logits: (num_styles, num_examples, num_choices)
+    logit_tensors = []
+    for s in style_names:
+        raw = all_results[s]["logits"]  # list of lists
+        # Pad to num_choices if needed (some examples might have fewer choices)
+        padded = [
+            row + [float("-inf")] * (num_choices - len(row))
+            if len(row) < num_choices else row[:num_choices]
+            for row in raw
+        ]
+        logit_tensors.append(torch.tensor(padded))
 
-        if len(tied) == 1:
-            ensemble_preds.append(tied[0])
-        else:
-            # Tie-break: pick the choice with highest summed logit across styles
-            num_choices = len(examples[i]["choices"])
-            summed = [0.0] * num_choices
-            for s in style_names:
-                logits_i = all_results[s]["logits"][i]
-                for c in range(min(num_choices, len(logits_i))):
-                    summed[c] += logits_i[c]
-            ensemble_preds.append(max(range(num_choices), key=lambda c: summed[c]))
+    stacked = torch.stack(logit_tensors)  # (S, N, C)
+
+    # Normalize: zero-mean each style's logits per example (removes scale bias)
+    means = stacked.mean(dim=-1, keepdim=True)  # (S, N, 1)
+    normed = stacked - means
+
+    # Sum across styles → (N, C)
+    summed = normed.sum(dim=0)
+
+    ensemble_preds = summed.argmax(dim=-1).tolist()
 
     # Compute ensemble accuracy
     correct = sum(
@@ -211,7 +237,7 @@ def evaluate_all_prompts(
     total = sum(1 for ex in examples if ex.get("answer", -1) >= 0)
     ensemble_acc = correct / total if total > 0 else 0.0
 
-    print(f"  Ensemble (majority vote): {ensemble_acc:.2%}")
+    print(f"  Ensemble (logit-sum): {ensemble_acc:.2%}")
 
     # Return ensemble if it beats all individuals, otherwise return best single
     best_single = max(all_results.values(), key=lambda r: r["accuracy"])
